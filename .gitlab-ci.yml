@@ -1,0 +1,100 @@
+stages:
+- lint
+- build
+- publish
+
+variables:
+  DOCKER_BUILDER_TAG: "latest"
+  DOCKER_DIND_TAG: "latest"
+  IMAGE_REMOVER_TAG: "latest"
+  GIT_STRATEGY: fetch
+  GIT_DEPTH: 0
+  GIT_CLONE_PATH: $CI_BUILDS_DIR/fetch/$CI_RUNNER_SHORT_TOKEN/$CI_CONCURRENT_ID/$CI_PROJECT_PATH
+
+include:
+- template: Workflows/Branch-Pipelines.gitlab-ci.yml
+- project: 'hive/common-ci-configuration'
+  ref: develop
+  file:
+  - '/templates/docker_image_jobs.gitlab-ci.yml'
+
+default:
+  hooks:
+    pre_get_sources_script:
+    - |
+      (
+      cd "${CI_PROJECT_DIR:-/builds}" 2>/dev/null || exit 0
+      if [ -d ".git" ]; then
+        find .git -name "*.lock" -delete 2>/dev/null || true
+        if ! git rev-parse HEAD >/dev/null 2>&1; then
+          rm -rf .git
+        fi
+      fi
+      )
+
+.lint_job:
+  extends: .job-defaults
+  stage: lint
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  artifacts:
+    name: lint-results
+    when: always
+  tags:
+  - public-runner-docker
+
+lint_bash_scripts:
+  extends: .lint_job
+  image: koalaman/shellcheck-alpine:latest
+  before_script:
+  - apk add xmlstarlet
+  script:
+  - find . -name .git -type d -prune -o -type f -name
+    \*.sh -exec shellcheck -f checkstyle {} + | tee shellcheck-checkstyle-result.xml
+  after_script:
+  - xmlstarlet tr misc/checkstyle2junit.xslt shellcheck-checkstyle-result.xml > shellcheck-junit-result.xml
+  artifacts:
+    paths:
+    - shellcheck-checkstyle-result.xml
+    - shellcheck-junit-result.xml
+    reports:
+      junit: shellcheck-junit-result.xml
+
+lint_sql_scripts:
+  extends: .lint_job
+  image:
+    name: sqlfluff/sqlfluff:2.1.4
+    entrypoint: [""]
+  script:
+  - sqlfluff lint --format yaml --write-output sql-lint.yaml --dialect postgres ||
+    true
+  - |
+    if [ -f sql-lint.yaml ]; then
+      cat sql-lint.yaml
+    fi
+  artifacts:
+    paths:
+    - sql-lint.yaml
+
+build_images:
+  extends: .docker_image_builder_job_template
+  stage: build
+  before_script:
+  - !reference [.docker_image_builder_job_template, before_script]
+  - |
+    echo -e "\e[0Ksection_start:$(date +%s):login[collapsed=true]\r\e[0KLogging to Docker registry..."
+    docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    echo -e "\e[0Ksection_end:$(date +%s):login\r\e[0K"
+  - |
+    export DOCKER_BUILDKIT=1
+  script:
+  - |
+    export DOCKER_BUILDKIT=1
+    $CI_PROJECT_DIR/scripts/build_images.sh --push
+  tags:
+  - public-runner-docker
+
+publish_images:
+  extends: .docker_publish_job_template
+  variables:
+    PUBLISH_IMAGES: "proxy-whitelist"

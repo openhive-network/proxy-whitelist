@@ -1,0 +1,622 @@
+SET ROLE proxy_whitelist_owner;
+
+-- Process a batch of posts: extract image URLs, resolve proxy URLs, write to Redis.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.process_posts(
+    _post_ids INT[],
+    _worker INT
+)
+RETURNS INT
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    rec RECORD;
+    __urls TEXT[];
+    __resolved TEXT[];
+    __all_resolved TEXT[];
+    __total INT := 0;
+    __batch_count INT;
+BEGIN
+    __batch_count := 0;
+
+    FOR rec IN
+        SELECT hp.id AS post_id,
+               hpd.body,
+               hpd.json,
+               ha.name AS author,
+               hp.block_num
+        FROM unnest(_post_ids) AS sel(id)
+        JOIN hivemind_app.hive_posts hp ON hp.id = sel.id
+        JOIN hivemind_app.hive_post_data hpd ON hpd.id = hp.id
+        JOIN hivemind_app.hive_accounts ha ON ha.id = hp.author_id
+        WHERE hp.counter_deleted = 0
+    LOOP
+        -- Extract raw image URLs from body + json_metadata
+        __urls := proxy_whitelist_app.extract_image_urls(rec.body, rec.json);
+
+        -- Resolve each URL to original upstream URL
+        __all_resolved := ARRAY[]::TEXT[];
+        FOR i IN 1..COALESCE(array_length(__urls, 1), 0) LOOP
+            __resolved := proxy_whitelist_app.resolve_proxy_url(__urls[i]);
+            IF __resolved IS NOT NULL THEN
+                __all_resolved := __all_resolved || __resolved;
+            END IF;
+        END LOOP;
+
+        -- Write to Redis
+        IF array_length(__all_resolved, 1) > 0 THEN
+            __total := __total + proxy_whitelist_app.redis_whitelist_urls(
+                __all_resolved, rec.author
+            );
+        END IF;
+
+        -- Track processed post
+        INSERT INTO proxy_whitelist_app.processed_posts (post_id, last_block_num)
+        VALUES (rec.post_id, rec.block_num)
+        ON CONFLICT (post_id) DO UPDATE
+            SET last_block_num = EXCLUDED.last_block_num;
+
+        __batch_count := __batch_count + 1;
+    END LOOP;
+
+    RETURN __total;
+END;
+$$;
+
+-- Process profile images (avatars and covers) from all accounts.
+-- Called periodically (every N batches) to pick up profile image changes.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.process_profile_images()
+RETURNS INT
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    rec RECORD;
+    __profile_urls TEXT[];
+    __resolved TEXT[];
+    __all_resolved TEXT[];
+    __total INT := 0;
+BEGIN
+    FOR rec IN
+        SELECT ha.name,
+               ha.posting_json_metadata,
+               ha.json_metadata
+        FROM hivemind_app.hive_accounts ha
+        WHERE ha.posting_json_metadata ~ '"profile_image"'
+           OR ha.json_metadata ~ '"profile_image"'
+           OR ha.posting_json_metadata ~ '"cover_image"'
+           OR ha.json_metadata ~ '"cover_image"'
+    LOOP
+        __profile_urls := proxy_whitelist_app.extract_profile_urls(
+            rec.posting_json_metadata, rec.json_metadata
+        );
+
+        IF __profile_urls IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        -- Resolve each profile URL
+        __all_resolved := ARRAY[]::TEXT[];
+        FOR i IN 1..COALESCE(array_length(__profile_urls, 1), 0) LOOP
+            __resolved := proxy_whitelist_app.resolve_proxy_url(__profile_urls[i]);
+            IF __resolved IS NOT NULL THEN
+                __all_resolved := __all_resolved || __resolved;
+            END IF;
+        END LOOP;
+
+        IF array_length(__all_resolved, 1) > 0 THEN
+            __total := __total + proxy_whitelist_app.redis_whitelist_urls(
+                __all_resolved, rec.name
+            );
+        END IF;
+    END LOOP;
+
+    RAISE NOTICE 'Profile images: whitelisted % URLs', __total;
+    RETURN __total;
+END;
+$$;
+
+-- Block range processing wrapper for massive processing stage.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.block_range_data(
+    _from INT, _to INT, _logs BOOLEAN, _worker INT
+)
+RETURNS INT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    __total INT := 0;
+    __post_ids INT[];
+BEGIN
+    -- Get all posts in this block range
+    SELECT ARRAY_AGG(hp.id ORDER BY hp.id)
+    INTO __post_ids
+    FROM hivemind_app.hive_posts hp
+    WHERE (
+        hp.block_num_created BETWEEN _from AND _to
+        OR hp.block_num BETWEEN _from AND _to
+    )
+    AND hp.counter_deleted = 0;
+
+    IF __post_ids IS NOT NULL AND array_length(__post_ids, 1) > 0 THEN
+        __total := proxy_whitelist_app.process_posts(__post_ids, _worker);
+        IF _logs THEN
+            RAISE NOTICE 'worker % blocks %-% : % posts, % URLs whitelisted',
+                         _worker, _from, _to,
+                         array_length(__post_ids, 1), __total;
+        END IF;
+    END IF;
+
+    RETURN __total;
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE proxy_whitelist_app.massive_processing(
+    IN _from INT, IN _to INT, IN _logs BOOLEAN, IN _worker INT, OUT _done INT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM set_config('synchronous_commit', 'OFF', false);
+    SELECT proxy_whitelist_app.block_range_data(_from, _to, _logs, _worker) INTO _done;
+END
+$$;
+
+CREATE OR REPLACE PROCEDURE proxy_whitelist_app.single_processing(
+    IN _from INT, IN _to INT, IN _logs BOOLEAN, IN _worker INT, OUT _done INT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM set_config('synchronous_commit', 'ON', false);
+    SELECT proxy_whitelist_app.block_range_data(_from, _to, _logs, _worker) INTO _done;
+END
+$$;
+
+CREATE OR REPLACE PROCEDURE proxy_whitelist_app.process_blocks(
+    _context_name hive.CONTEXT_NAME,
+    _block_range hive.BLOCKS_RANGE,
+    IN _worker INT,
+    OUT _done INT,
+    _logs BOOLEAN = true
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF hive.get_current_stage_name(_context_name) = 'MASSIVE_PROCESSING' THEN
+        CALL proxy_whitelist_app.massive_processing(
+            _block_range.first_block, _block_range.last_block, _logs, _worker, _done
+        );
+        RETURN;
+    END IF;
+
+    CALL proxy_whitelist_app.single_processing(
+        _block_range.first_block, _block_range.last_block, _logs, _worker, _done
+    );
+END
+$$;
+
+-- Check if processing should stop.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.isBreakingPending(
+    _appContext hive.CONTEXT_NAME,
+    _maxBlockLimit INT,
+    _blocks_range hive.BLOCKS_RANGE
+)
+RETURNS TEXT  -- NULL means no break
+LANGUAGE plpgsql
+PARALLEL SAFE
+AS $$
+BEGIN
+    IF _blocks_range IS NULL AND _maxBlockLimit IS NOT NULL THEN
+        IF hive.app_get_current_block_num(_appContext) >= _maxBlockLimit THEN
+            RAISE NOTICE 'Worker % reached blocks limit. Exiting at block: %.',
+                         _appContext, hive.app_get_current_block_num(_appContext);
+            RETURN 'BLOCK_LIMIT_REACHED';
+        END IF;
+    END IF;
+
+    IF NOT proxy_whitelist_app.continueProcessing() THEN
+        RAISE NOTICE 'Worker % exiting at block: %.',
+                     _appContext, hive.app_get_current_block_num(_appContext);
+        RETURN 'BREAK_ON_USER_REQUEST';
+    END IF;
+
+    RETURN NULL;
+END
+$$;
+
+-- Wait for start block to be available.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.wait_for_start_block(
+    _start_block INT, _worker INT, _context hafd.CONTEXT_NAME
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+PARALLEL SAFE
+STABLE
+AS $$
+DECLARE
+    __head_of_irreversible_block BIGINT;
+BEGIN
+    IF _start_block != 0 THEN
+        SELECT hir.consistent_block INTO __head_of_irreversible_block
+        FROM hafd.hive_state hir;
+
+        IF _start_block > __head_of_irreversible_block THEN
+            PERFORM pg_sleep(5);
+            IF _worker = 1 THEN
+                RAISE INFO 'Waiting for start block(%). HAF head is %',
+                           _start_block, __head_of_irreversible_block;
+            END IF;
+            RETURN FALSE;
+        END IF;
+    END IF;
+
+    RETURN TRUE;
+END
+$$;
+
+-- Advisory lock helper with timeout (same as hivesense).
+CREATE OR REPLACE PROCEDURE proxy_whitelist_app.wait_for_advisory_lock(
+    _namespace INT, _worker INT, _timeout_ms INT DEFAULT 5000
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  LOOP
+    COMMIT;
+    PERFORM set_config('lock_timeout', _timeout_ms::text, true);
+
+    BEGIN
+      PERFORM pg_advisory_lock(_namespace, _worker);
+      PERFORM set_config('lock_timeout', '0', true);
+      EXIT;
+    EXCEPTION
+      WHEN SQLSTATE '55P03' OR SQLSTATE '57014' THEN
+        IF EXISTS (SELECT FROM pg_locks
+           WHERE locktype = 'advisory'
+             AND classid  = _namespace
+             AND objid    = _worker
+             AND pid      = pg_backend_pid()
+        ) THEN
+          PERFORM set_config('lock_timeout', '0', true);
+          EXIT;
+        END IF;
+    END;
+  END LOOP;
+END;
+$$;
+
+
+-- Scheduler: receives block ranges from HAF, waits for hivemind, distributes tasks.
+CREATE OR REPLACE PROCEDURE proxy_whitelist_app.scheduler(
+    IN  _app_context_base_name  hive.context_name,
+    IN  _workers                INT,
+    IN  _max_block_limit        INT DEFAULT null
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    __hivemind_current_block        INT;
+    __context_name                  hive.context_name := _app_context_base_name;
+    __start_block                   INT := 0;
+    __blocks_range                  hive.blocks_range := (0,0);
+    __planned_range                 hive.blocks_range;
+    __batch_id                      BIGINT;
+    __todo                          INT;
+    __breaking_reason               TEXT := null;
+    __advisory_lock_namespace_begin INT;
+    __start_key_namespace           INT;
+    __done_key_namespace            INT;
+    __ack_key_namespace             INT;
+    __shard                         INT;
+    __posts_per_chunk      CONSTANT INT := 100;
+    __batch_counter                 INT := 0;
+    __poll_profile_every            INT;
+BEGIN
+    SELECT start_block, advisory_lock_namespace_begin, poll_profile_images_every_n_batches
+    INTO __start_block, __advisory_lock_namespace_begin, __poll_profile_every
+    FROM proxy_whitelist_app.app_status;
+
+    __start_key_namespace := __advisory_lock_namespace_begin;
+    __done_key_namespace := __advisory_lock_namespace_begin + 1;
+    __ack_key_namespace := __advisory_lock_namespace_begin + 2;
+
+    -- Acquire start_key and ack_key for all workers so they block
+    FOR __shard IN 1.._workers LOOP
+        PERFORM pg_advisory_lock(__start_key_namespace, __shard);
+        PERFORM pg_advisory_lock(__ack_key_namespace, __shard);
+    END LOOP;
+
+    RAISE NOTICE 'Scheduler: start_keys locked for % workers; entering main loop...', _workers;
+
+    IF _max_block_limit IS NOT NULL THEN
+        RAISE NOTICE 'Max block limit: %', _max_block_limit;
+    END IF;
+
+    PERFORM proxy_whitelist_app.allowProcessing();
+
+    RAISE NOTICE 'Last block processed by %: %',
+                 __context_name,
+                 hive.app_get_current_block_num(__context_name);
+
+    IF hive.app_get_current_block_num(__context_name) < __start_block - 1 THEN
+        PERFORM hive.app_set_current_block_num(__context_name, __start_block - 1);
+    END IF;
+
+    RAISE NOTICE 'Entering scheduler main loop...';
+
+    LOOP
+        -- Wait for start block
+        IF NOT proxy_whitelist_app.wait_for_start_block(__start_block, 1, __context_name) THEN
+            RAISE NOTICE 'Waiting for start block...';
+            PERFORM pg_sleep(0.1);
+            CONTINUE;
+        END IF;
+
+        -- Request next range from HAF, then rollback to free xmin
+        CALL hive.app_next_iteration(
+            __context_name,
+            __blocks_range,
+            _override_max_batch => NULL,
+            _limit              => _max_block_limit
+        );
+
+        __planned_range := __blocks_range;
+        ROLLBACK;
+
+        IF __blocks_range IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        -- Wait for hivemind to process through this range (read-only loop)
+        LOOP
+            SELECT hive.app_get_current_block_num('hivemind_app')
+              INTO __hivemind_current_block;
+
+            EXIT WHEN __hivemind_current_block >= __planned_range.last_block;
+
+            RAISE NOTICE 'Waiting for hivemind to reach block % (at %)',
+                         __planned_range.last_block,
+                         __hivemind_current_block;
+            COMMIT;
+            PERFORM pg_sleep(1);
+
+            __breaking_reason := proxy_whitelist_app.isBreakingPending(
+                __context_name, _max_block_limit, NULL
+            );
+            IF __breaking_reason IS NOT NULL THEN
+                RETURN;
+            END IF;
+        END LOOP;
+
+        -- Re-claim the block range inside a write transaction
+        CALL hive.app_next_iteration(
+            __context_name,
+            __blocks_range,
+            _override_max_batch => NULL,
+            _limit              => _max_block_limit
+        );
+
+        __breaking_reason := proxy_whitelist_app.isBreakingPending(
+            __context_name, _max_block_limit, __blocks_range
+        );
+        IF __breaking_reason IS NOT NULL THEN
+            ROLLBACK;
+            RETURN;
+        END IF;
+
+        IF __blocks_range IS NULL THEN
+            RAISE NOTICE '__blocks_range IS NULL';
+            CONTINUE;
+        END IF;
+
+        -- Wait for hivemind again (in transaction)
+        LOOP
+            SELECT hive.app_get_current_block_num('hivemind_app')
+              INTO __hivemind_current_block;
+            EXIT WHEN __hivemind_current_block >= __blocks_range.last_block;
+            RAISE NOTICE 'Waiting for hivemind to reach block % (at %) [in tx]',
+                         __blocks_range.last_block,
+                         __hivemind_current_block;
+            PERFORM pg_sleep(1);
+            __breaking_reason := proxy_whitelist_app.isBreakingPending(
+                __context_name, _max_block_limit, NULL
+            );
+            IF __breaking_reason IS NOT NULL THEN
+                RETURN;
+            END IF;
+        END LOOP;
+
+        -- Build task batches from posts in this block range
+        __batch_id := nextval('proxy_whitelist_app.batch_seq');
+        WITH posts AS (
+          SELECT hp.id AS post_id,
+                 GREATEST(hp.block_num_created, hp.block_num) AS blk
+            FROM hivemind_app.hive_posts hp
+            JOIN hivemind_app.hive_post_data hpd USING(id)
+           WHERE hp.counter_deleted = 0
+             AND (
+                   hp.block_num_created BETWEEN __blocks_range.first_block AND __blocks_range.last_block
+                OR hp.block_num          BETWEEN __blocks_range.first_block AND __blocks_range.last_block
+             )
+        ),
+        numbered AS (
+          SELECT post_id, blk,
+                 ROW_NUMBER() OVER (ORDER BY blk) AS rn
+          FROM posts
+        ),
+        chunked AS (
+          SELECT post_id, blk,
+                 ((rn - 1) / __posts_per_chunk)::INT AS chunk_idx
+          FROM numbered
+        ),
+        grouped AS (
+          SELECT chunk_idx,
+                 ARRAY_AGG(post_id ORDER BY post_id) AS pids,
+                 MIN(blk) AS first_blk,
+                 MAX(blk) AS last_blk
+          FROM chunked
+          GROUP BY chunk_idx
+        )
+        INSERT INTO proxy_whitelist_app.block_tasks(
+            batch_id, shard, post_ids, first_block, last_block
+        )
+        SELECT __batch_id, NULL, pids, first_blk, last_blk
+        FROM grouped;
+
+        LOCK TABLE hivemind_app.hive_posts IN SHARE MODE;
+
+        -- Upsert processed_posts for tracking
+        INSERT INTO proxy_whitelist_app.processed_posts (post_id, last_block_num)
+        SELECT id, -1
+        FROM (
+            SELECT DISTINCT UNNEST(post_ids) AS id
+            FROM proxy_whitelist_app.block_tasks
+            WHERE batch_id = __batch_id
+        ) AS src
+        ORDER BY id
+        ON CONFLICT (post_id) DO NOTHING;
+
+        COMMIT;  -- let workers see tasks
+
+        -- Wake all workers
+        FOR __shard IN 1.._workers LOOP
+            PERFORM pg_advisory_unlock(__start_key_namespace, __shard);
+        END LOOP;
+
+        -- Wait for each worker to finish
+        FOR __shard IN 1.._workers LOOP
+            CALL proxy_whitelist_app.wait_for_advisory_lock(__done_key_namespace, __shard);
+            PERFORM pg_advisory_unlock(__done_key_namespace, __shard);
+            PERFORM pg_advisory_unlock(__ack_key_namespace, __shard);
+            PERFORM pg_advisory_lock(__ack_key_namespace, __shard);
+            PERFORM pg_advisory_lock(__start_key_namespace, __shard);
+        END LOOP;
+
+        -- Verify all tasks done
+        LOOP
+            SELECT COUNT(*) INTO __todo
+            FROM proxy_whitelist_app.block_tasks
+            WHERE batch_id = __batch_id
+              AND status <> 'done';
+
+            EXIT WHEN __todo = 0;
+            RAISE NOTICE 'SCHEDULER: queue not empty, polling...';
+            PERFORM pg_sleep(0.1);
+        END LOOP;
+
+        TRUNCATE proxy_whitelist_app.block_tasks;
+
+        -- Periodically process profile images
+        __batch_counter := __batch_counter + 1;
+        IF __batch_counter % __poll_profile_every = 0 THEN
+            PERFORM proxy_whitelist_app.process_profile_images();
+        END IF;
+
+    END LOOP;
+
+    ASSERT FALSE, 'Scheduler: unreachable';
+END
+$$;
+
+
+-- Worker loop: claims tasks from block_tasks and processes them.
+CREATE OR REPLACE PROCEDURE proxy_whitelist_app.worker_loop(
+    IN _worker            INT,
+    IN _app_context_name  hive.context_name,
+    IN _max_block_limit   INT DEFAULT NULL
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    __task                          RECORD;
+    __urls_whitelisted              INT;
+    __breaking_reason               TEXT := NULL;
+    __advisory_lock_namespace_begin INT;
+    __start_key_namespace           INT;
+    __done_key_namespace            INT;
+    __ack_key_namespace             INT;
+BEGIN
+    SELECT advisory_lock_namespace_begin INTO __advisory_lock_namespace_begin
+    FROM proxy_whitelist_app.app_status;
+
+    __start_key_namespace := __advisory_lock_namespace_begin;
+    __done_key_namespace := __advisory_lock_namespace_begin + 1;
+    __ack_key_namespace := __advisory_lock_namespace_begin + 2;
+
+    LOOP
+        -- Take done_key (never blocks for long)
+        PERFORM pg_advisory_lock(__done_key_namespace, _worker);
+
+        -- Block until scheduler says "go"
+        CALL proxy_whitelist_app.wait_for_advisory_lock(__start_key_namespace, _worker);
+
+        -- Release start_key
+        PERFORM pg_advisory_unlock(__start_key_namespace, _worker);
+
+        LOOP
+            -- Claim a pending task
+            SELECT task_id, post_ids, first_block, last_block
+              INTO __task
+            FROM proxy_whitelist_app.block_tasks
+            WHERE status = 'pending'
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1;
+
+            IF NOT FOUND THEN
+                ROLLBACK;
+                EXIT;
+            END IF;
+
+            -- Mark running
+            UPDATE proxy_whitelist_app.block_tasks
+               SET status     = 'running',
+                   shard      = _worker,
+                   claimed_at = clock_timestamp()
+             WHERE task_id    = __task.task_id;
+
+            IF __task.last_block = __task.first_block THEN
+                RAISE NOTICE 'worker % processing block % (% posts)',
+                             _worker, __task.first_block,
+                             array_length(__task.post_ids, 1);
+            ELSE
+                RAISE NOTICE 'worker % processing blocks % to % (% posts)',
+                             LPAD(_worker::text, 2),
+                             __task.first_block, __task.last_block,
+                             array_length(__task.post_ids, 1);
+            END IF;
+
+            __urls_whitelisted := proxy_whitelist_app.process_posts(
+                __task.post_ids, _worker
+            );
+
+            RAISE NOTICE 'worker % : % URLs whitelisted', _worker, __urls_whitelisted;
+
+            -- Mark done
+            UPDATE proxy_whitelist_app.block_tasks
+               SET status      = 'done',
+                   finished_at = clock_timestamp()
+             WHERE task_id = __task.task_id;
+
+            COMMIT;
+        END LOOP;
+
+        -- Signal "done" to scheduler
+        PERFORM pg_advisory_unlock(__done_key_namespace, _worker);
+
+        -- Wait for scheduler ack
+        CALL proxy_whitelist_app.wait_for_advisory_lock(__ack_key_namespace, _worker);
+        PERFORM pg_advisory_unlock(__ack_key_namespace, _worker);
+
+        __breaking_reason := proxy_whitelist_app.isBreakingPending(
+            _app_context_name, _max_block_limit, NULL
+        );
+        IF __breaking_reason IS NOT NULL THEN
+            RETURN;
+        END IF;
+    END LOOP;
+
+    ASSERT FALSE, 'Worker loop: unreachable';
+END
+$$;
+
+RESET ROLE;
