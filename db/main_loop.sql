@@ -308,7 +308,7 @@ DECLARE
     __done_key_namespace            INT;
     __ack_key_namespace             INT;
     __shard                         INT;
-    __posts_per_chunk      CONSTANT INT := 100;
+    __posts_per_chunk      CONSTANT INT := 2000;
     __batch_counter                 INT := 0;
     __poll_profile_every            INT;
 BEGIN
@@ -347,7 +347,6 @@ BEGIN
     LOOP
         -- Wait for start block
         IF NOT proxy_whitelist_app.wait_for_start_block(__start_block, 1, __context_name) THEN
-            RAISE NOTICE 'Waiting for start block...';
             PERFORM pg_sleep(0.1);
             CONTINUE;
         END IF;
@@ -405,7 +404,6 @@ BEGIN
         END IF;
 
         IF __blocks_range IS NULL THEN
-            RAISE NOTICE '__blocks_range IS NULL';
             CONTINUE;
         END IF;
 
@@ -500,7 +498,6 @@ BEGIN
               AND status <> 'done';
 
             EXIT WHEN __todo = 0;
-            RAISE NOTICE 'SCHEDULER: queue not empty, polling...';
             PERFORM pg_sleep(0.1);
         END LOOP;
 
@@ -574,22 +571,13 @@ BEGIN
                    claimed_at = clock_timestamp()
              WHERE task_id    = __task.task_id;
 
-            IF __task.last_block = __task.first_block THEN
-                RAISE NOTICE 'worker % processing block % (% posts)',
-                             _worker, __task.first_block,
-                             array_length(__task.post_ids, 1);
-            ELSE
-                RAISE NOTICE 'worker % processing blocks % to % (% posts)',
-                             LPAD(_worker::text, 2),
-                             __task.first_block, __task.last_block,
-                             array_length(__task.post_ids, 1);
-            END IF;
-
             __urls_whitelisted := proxy_whitelist_app.process_posts(
                 __task.post_ids, _worker
             );
 
-            RAISE NOTICE 'worker % : % URLs whitelisted', _worker, __urls_whitelisted;
+            RAISE NOTICE 'worker % blocks %-% : % posts, % URLs',
+                         _worker, __task.first_block, __task.last_block,
+                         array_length(__task.post_ids, 1), __urls_whitelisted;
 
             -- Mark done
             UPDATE proxy_whitelist_app.block_tasks

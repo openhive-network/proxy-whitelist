@@ -30,7 +30,7 @@ AS $BODY$
             for img in meta.get('image', []):
                 if isinstance(img, str) and IMAGE_RE.match(img):
                     urls.add(img)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, AttributeError):
             pass
 
     return list(urls)
@@ -112,13 +112,15 @@ AS $BODY$
             continue
         try:
             meta = json.loads(raw)
+            if not isinstance(meta, dict):
+                continue
             profile = meta.get('profile', meta)
             if isinstance(profile, dict):
                 for key in ('profile_image', 'cover_image'):
                     val = profile.get(key)
                     if isinstance(val, str) and val.startswith('http'):
                         urls.add(val)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, AttributeError):
             pass
 
     return list(urls) if urls else None
