@@ -25,6 +25,8 @@ AS $BODY$
     if json_metadata:
         try:
             meta = json.loads(json_metadata)
+            if not isinstance(meta, dict):
+                return list(urls)
             for img in meta.get('image', []):
                 if isinstance(img, str) and IMAGE_RE.match(img):
                     urls.add(img)
