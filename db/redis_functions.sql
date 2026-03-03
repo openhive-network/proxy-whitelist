@@ -13,16 +13,16 @@ LANGUAGE plpython3u
 AS $BODY$
     import redis as redis_lib
 
-    if redis_url is None:
+    _url = redis_url
+    _password = None
+    if _url is None:
         r = plpy.execute(
             "SELECT redis_url, redis_password FROM proxy_whitelist_app.app_status LIMIT 1"
         )
-        redis_url = r[0]['redis_url']
-        redis_password = r[0].get('redis_password')
-    else:
-        redis_password = None
+        _url = r[0]['redis_url']
+        _password = r[0].get('redis_password')
 
-    client = redis_lib.from_url(redis_url, password=redis_password)
+    client = redis_lib.from_url(_url, password=_password)
 
     # Check if author is blacklisted
     if client.sismember('proxy:whitelist:blacklisted_accounts', author):
