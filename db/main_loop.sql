@@ -461,8 +461,6 @@ BEGIN
         SELECT __batch_id, NULL, pids, first_blk, last_blk
         FROM grouped;
 
-        LOCK TABLE hivemind_app.hive_posts IN SHARE MODE;
-
         -- Upsert processed_posts for tracking
         INSERT INTO proxy_whitelist_app.processed_posts (post_id, last_block_num)
         SELECT id, -1
@@ -506,6 +504,7 @@ BEGIN
         -- Periodically process profile images
         __batch_counter := __batch_counter + 1;
         IF __batch_counter % __poll_profile_every = 0 THEN
+            RAISE NOTICE 'Starting profile image scan (batch %)...', __batch_counter;
             PERFORM proxy_whitelist_app.process_profile_images();
         END IF;
 
