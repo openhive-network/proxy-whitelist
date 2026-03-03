@@ -22,7 +22,12 @@ AS $BODY$
         _url = r[0]['redis_url']
         _password = r[0].get('redis_password')
 
-    client = redis_lib.from_url(_url, password=_password)
+    # Reuse connection across calls within the same session
+    cache_key = 'redis_client'
+    client = SD.get(cache_key)
+    if client is None:
+        client = redis_lib.from_url(_url, password=_password)
+        SD[cache_key] = client
 
     # Check if author is blacklisted
     if client.sismember('proxy:whitelist:blacklisted_accounts', author):
