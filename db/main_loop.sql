@@ -429,11 +429,13 @@ BEGIN
         END IF;
 
         -- Wait for hivemind to process through this range (read-only loop)
+        -- Use last_block + 1 to ensure hivemind has fully committed all data
+        -- for the last block (its block pointer advances after commit).
         LOOP
             SELECT hive.app_get_current_block_num('hivemind_app')
               INTO __hivemind_current_block;
 
-            EXIT WHEN __hivemind_current_block >= __planned_range.last_block;
+            EXIT WHEN __hivemind_current_block > __planned_range.last_block;
 
             RAISE NOTICE 'Waiting for hivemind to reach block % (at %)',
                          __planned_range.last_block,
@@ -473,7 +475,7 @@ BEGIN
         LOOP
             SELECT hive.app_get_current_block_num('hivemind_app')
               INTO __hivemind_current_block;
-            EXIT WHEN __hivemind_current_block >= __blocks_range.last_block;
+            EXIT WHEN __hivemind_current_block > __blocks_range.last_block;
             RAISE NOTICE 'Waiting for hivemind to reach block % (at %) [in tx]',
                          __blocks_range.last_block,
                          __hivemind_current_block;
