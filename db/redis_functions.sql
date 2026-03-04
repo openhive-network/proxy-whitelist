@@ -12,6 +12,7 @@ RETURNS INT
 LANGUAGE plpython3u
 AS $BODY$
     import redis as redis_lib
+    import time
 
     _url = redis_url
     _password = None
@@ -26,28 +27,56 @@ AS $BODY$
     cache_key = 'redis_client'
     client = SD.get(cache_key)
     if client is None:
-        client = redis_lib.from_url(_url, password=_password)
+        client = redis_lib.from_url(_url, password=_password,
+                                    socket_connect_timeout=10,
+                                    socket_timeout=30)
         SD[cache_key] = client
 
-    # Check if author is blacklisted
-    if client.sismember('proxy:whitelist:blacklisted_accounts', author):
-        return 0
+    max_retries = 30
+    retry_delay = 2  # seconds
 
-    pipe = client.pipeline()
-    count = 0
+    for attempt in range(max_retries):
+        try:
+            # Check if author is blacklisted
+            if client.sismember('proxy:whitelist:blacklisted_accounts', author):
+                return 0
 
-    for url in urls:
-        if url is None:
-            continue
-        pipe.sadd('proxy:whitelist:urls', url)
-        pipe.sadd('proxy:whitelist:account_urls:{}'.format(author), url)
-        pipe.sadd('proxy:whitelist:url_accounts:{}'.format(url), author)
-        count += 1
+            pipe = client.pipeline()
+            count = 0
 
-    if count > 0:
-        pipe.execute()
+            for url in urls:
+                if url is None:
+                    continue
+                pipe.sadd('proxy:whitelist:urls', url)
+                pipe.sadd('proxy:whitelist:account_urls:{}'.format(author), url)
+                pipe.sadd('proxy:whitelist:url_accounts:{}'.format(url), author)
+                count += 1
 
-    return count
+            if count > 0:
+                pipe.execute()
+
+            return count
+
+        except redis_lib.exceptions.BusyLoadingError:
+            if attempt < max_retries - 1:
+                plpy.notice('Redis is loading dataset, retrying in {}s (attempt {}/{})'.format(
+                    retry_delay, attempt + 1, max_retries))
+                time.sleep(retry_delay)
+                continue
+            raise
+        except redis_lib.exceptions.ConnectionError:
+            # Drop cached client so next call reconnects
+            SD.pop(cache_key, None)
+            if attempt < max_retries - 1:
+                plpy.notice('Redis connection error, reconnecting in {}s (attempt {}/{})'.format(
+                    retry_delay, attempt + 1, max_retries))
+                time.sleep(retry_delay)
+                client = redis_lib.from_url(_url, password=_password,
+                                            socket_connect_timeout=10,
+                                            socket_timeout=30)
+                SD[cache_key] = client
+                continue
+            raise
 $BODY$;
 
 GRANT EXECUTE ON FUNCTION proxy_whitelist_app.redis_whitelist_urls(TEXT[], TEXT, TEXT)

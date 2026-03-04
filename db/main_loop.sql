@@ -318,8 +318,39 @@ BEGIN
 END
 $$;
 
+-- Advisory lock helper with timeout (same as hivesense).
+CREATE OR REPLACE PROCEDURE proxy_whitelist_app.wait_for_advisory_lock(
+    _namespace INT, _worker INT, _timeout_ms INT DEFAULT 5000
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  LOOP
+    COMMIT;
+    PERFORM set_config('lock_timeout', _timeout_ms::text, true);
+
+    BEGIN
+      PERFORM pg_advisory_lock(_namespace, _worker);
+      PERFORM set_config('lock_timeout', '0', true);
+      EXIT;
+    EXCEPTION
+      WHEN SQLSTATE '55P03' OR SQLSTATE '57014' THEN
+        IF EXISTS (SELECT FROM pg_locks
+           WHERE locktype = 'advisory'
+             AND classid  = _namespace
+             AND objid    = _worker
+             AND pid      = pg_backend_pid()
+        ) THEN
+          PERFORM set_config('lock_timeout', '0', true);
+          EXIT;
+        END IF;
+    END;
+  END LOOP;
+END;
+$$;
+
+
 -- Scheduler: receives block ranges from HAF, waits for hivemind, distributes tasks.
--- Workers poll block_tasks independently — no advisory lock coordination needed.
 CREATE OR REPLACE PROCEDURE proxy_whitelist_app.scheduler(
     IN  _app_context_base_name  hive.context_name,
     IN  _workers                INT,
@@ -336,11 +367,28 @@ DECLARE
     __batch_id                      BIGINT;
     __todo                          INT;
     __breaking_reason               TEXT := null;
+    __advisory_lock_namespace_begin INT;
+    __start_key_namespace           INT;
+    __done_key_namespace            INT;
+    __ack_key_namespace             INT;
+    __shard                         INT;
     __posts_per_chunk      CONSTANT INT := 2000;
 BEGIN
-    SELECT start_block
-    INTO __start_block
+    SELECT start_block, advisory_lock_namespace_begin
+    INTO __start_block, __advisory_lock_namespace_begin
     FROM proxy_whitelist_app.app_status;
+
+    __start_key_namespace := __advisory_lock_namespace_begin;
+    __done_key_namespace := __advisory_lock_namespace_begin + 1;
+    __ack_key_namespace := __advisory_lock_namespace_begin + 2;
+
+    -- Acquire start_key and ack_key for all workers so they block
+    FOR __shard IN 1.._workers LOOP
+        PERFORM pg_advisory_lock(__start_key_namespace, __shard);
+        PERFORM pg_advisory_lock(__ack_key_namespace, __shard);
+    END LOOP;
+
+    RAISE NOTICE 'Scheduler: start_keys locked for % workers; entering main loop...', _workers;
 
     IF _max_block_limit IS NOT NULL THEN
         RAISE NOTICE 'Max block limit: %', _max_block_limit;
@@ -488,7 +536,21 @@ BEGIN
 
         COMMIT;  -- let workers see tasks
 
-        -- Wait for all tasks in this batch to complete
+        -- Wake all workers
+        FOR __shard IN 1.._workers LOOP
+            PERFORM pg_advisory_unlock(__start_key_namespace, __shard);
+        END LOOP;
+
+        -- Wait for each worker to finish
+        FOR __shard IN 1.._workers LOOP
+            CALL proxy_whitelist_app.wait_for_advisory_lock(__done_key_namespace, __shard);
+            PERFORM pg_advisory_unlock(__done_key_namespace, __shard);
+            PERFORM pg_advisory_unlock(__ack_key_namespace, __shard);
+            PERFORM pg_advisory_lock(__ack_key_namespace, __shard);
+            PERFORM pg_advisory_lock(__start_key_namespace, __shard);
+        END LOOP;
+
+        -- Verify all tasks done
         LOOP
             SELECT COUNT(*) INTO __todo
             FROM proxy_whitelist_app.block_tasks
@@ -496,23 +558,20 @@ BEGIN
               AND status <> 'done';
 
             EXIT WHEN __todo = 0;
-            COMMIT;
-            PERFORM pg_sleep(0.2);
-
-            __breaking_reason := proxy_whitelist_app.isBreakingPending(
-                __context_name, _max_block_limit, NULL
-            );
-            IF __breaking_reason IS NOT NULL THEN
-                RETURN;
-            END IF;
+            PERFORM pg_sleep(0.1);
         END LOOP;
 
         TRUNCATE proxy_whitelist_app.block_tasks;
 
         -- Process profile images for accounts updated in this block range
-        PERFORM proxy_whitelist_app.process_profile_images_incremental(
-            __blocks_range.first_block, __blocks_range.last_block
-        );
+        BEGIN
+            PERFORM proxy_whitelist_app.process_profile_images_incremental(
+                __blocks_range.first_block, __blocks_range.last_block
+            );
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'Profile image processing failed for blocks %-%, will retry next cycle: %',
+                          __blocks_range.first_block, __blocks_range.last_block, SQLERRM;
+        END;
 
     END LOOP;
 
@@ -521,7 +580,7 @@ END
 $$;
 
 
--- Worker loop: polls block_tasks for pending work and processes it.
+-- Worker loop: claims tasks from block_tasks and processes them.
 CREATE OR REPLACE PROCEDURE proxy_whitelist_app.worker_loop(
     IN _worker            INT,
     IN _app_context_name  hive.context_name,
@@ -533,61 +592,89 @@ DECLARE
     __task                          RECORD;
     __urls_whitelisted              INT;
     __breaking_reason               TEXT := NULL;
-    __idle_count                    INT := 0;
+    __advisory_lock_namespace_begin INT;
+    __start_key_namespace           INT;
+    __done_key_namespace            INT;
+    __ack_key_namespace             INT;
 BEGIN
-    RAISE NOTICE 'Worker % starting', _worker;
+    SELECT advisory_lock_namespace_begin INTO __advisory_lock_namespace_begin
+    FROM proxy_whitelist_app.app_status;
+
+    __start_key_namespace := __advisory_lock_namespace_begin;
+    __done_key_namespace := __advisory_lock_namespace_begin + 1;
+    __ack_key_namespace := __advisory_lock_namespace_begin + 2;
 
     LOOP
-        -- Claim a pending task
-        SELECT task_id, post_ids, first_block, last_block
-          INTO __task
-        FROM proxy_whitelist_app.block_tasks
-        WHERE status = 'pending'
-        FOR UPDATE SKIP LOCKED
-        LIMIT 1;
+        -- Take done_key (never blocks for long)
+        PERFORM pg_advisory_lock(__done_key_namespace, _worker);
 
-        IF NOT FOUND THEN
-            ROLLBACK;
-            __idle_count := __idle_count + 1;
+        -- Block until scheduler says "go"
+        CALL proxy_whitelist_app.wait_for_advisory_lock(__start_key_namespace, _worker);
 
-            -- Check for stop every few idle cycles
-            IF __idle_count % 10 = 0 THEN
-                __breaking_reason := proxy_whitelist_app.isBreakingPending(
-                    _app_context_name, _max_block_limit, NULL
-                );
-                IF __breaking_reason IS NOT NULL THEN
-                    RETURN;
-                END IF;
+        -- Release start_key
+        PERFORM pg_advisory_unlock(__start_key_namespace, _worker);
+
+        LOOP
+            -- Claim a pending task
+            SELECT task_id, post_ids, first_block, last_block
+              INTO __task
+            FROM proxy_whitelist_app.block_tasks
+            WHERE status = 'pending'
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1;
+
+            IF NOT FOUND THEN
+                ROLLBACK;
+                EXIT;
             END IF;
 
-            PERFORM pg_sleep(0.2);
-            CONTINUE;
-        END IF;
+            -- Mark running
+            UPDATE proxy_whitelist_app.block_tasks
+               SET status     = 'running',
+                   shard      = _worker,
+                   claimed_at = clock_timestamp()
+             WHERE task_id    = __task.task_id;
 
-        __idle_count := 0;
+            BEGIN
+                __urls_whitelisted := proxy_whitelist_app.process_posts(
+                    __task.post_ids, _worker
+                );
+            EXCEPTION WHEN OTHERS THEN
+                -- Redis or other transient error: rollback this task,
+                -- it reverts to 'pending' and can be retried.
+                RAISE WARNING 'worker % task % failed: %, retrying after delay',
+                              _worker, __task.task_id, SQLERRM;
+                ROLLBACK;
+                PERFORM pg_sleep(5);
+                CONTINUE;
+            END;
 
-        -- Mark running
-        UPDATE proxy_whitelist_app.block_tasks
-           SET status     = 'running',
-               shard      = _worker,
-               claimed_at = clock_timestamp()
-         WHERE task_id    = __task.task_id;
+            RAISE NOTICE 'worker % blocks %-% : % posts, % URLs',
+                         _worker, __task.first_block, __task.last_block,
+                         array_length(__task.post_ids, 1), __urls_whitelisted;
 
-        __urls_whitelisted := proxy_whitelist_app.process_posts(
-            __task.post_ids, _worker
+            -- Mark done
+            UPDATE proxy_whitelist_app.block_tasks
+               SET status      = 'done',
+                   finished_at = clock_timestamp()
+             WHERE task_id = __task.task_id;
+
+            COMMIT;
+        END LOOP;
+
+        -- Signal "done" to scheduler
+        PERFORM pg_advisory_unlock(__done_key_namespace, _worker);
+
+        -- Wait for scheduler ack
+        CALL proxy_whitelist_app.wait_for_advisory_lock(__ack_key_namespace, _worker);
+        PERFORM pg_advisory_unlock(__ack_key_namespace, _worker);
+
+        __breaking_reason := proxy_whitelist_app.isBreakingPending(
+            _app_context_name, _max_block_limit, NULL
         );
-
-        RAISE NOTICE 'worker % blocks %-% : % posts, % URLs',
-                     _worker, __task.first_block, __task.last_block,
-                     array_length(__task.post_ids, 1), __urls_whitelisted;
-
-        -- Mark done
-        UPDATE proxy_whitelist_app.block_tasks
-           SET status      = 'done',
-               finished_at = clock_timestamp()
-         WHERE task_id = __task.task_id;
-
-        COMMIT;
+        IF __breaking_reason IS NOT NULL THEN
+            RETURN;
+        END IF;
     END LOOP;
 
     ASSERT FALSE, 'Worker loop: unreachable';

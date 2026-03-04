@@ -115,6 +115,19 @@ EOF
 # Record startup time for health checks
 date -uIseconds > /tmp/proxy_whitelist_startup_time.txt
 
+# Wait for Redis to be ready (loading RDB can take minutes for large datasets)
+echo "Waiting for Redis to accept commands..."
+while true; do
+    if psql "$(postgres_access proxy_whitelist_redis_check)" -v "ON_ERROR_STOP=on" -t -c \
+        "SELECT proxy_whitelist_app.redis_whitelist_urls(ARRAY[]::TEXT[], '', NULL);" \
+        >/dev/null 2>&1; then
+        echo "Redis is ready."
+        break
+    fi
+    echo "Redis not ready yet, retrying in 5s..."
+    sleep 5
+done
+
 launch_scheduler "$NUMBER_OF_WORKERS" "$PROCESS_BLOCK_LIMIT" &
 
 i=1
