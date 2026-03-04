@@ -494,7 +494,6 @@ BEGIN
           SELECT hp.id AS post_id,
                  GREATEST(hp.block_num_created, hp.block_num) AS blk
             FROM hivemind_app.hive_posts hp
-            JOIN hivemind_app.hive_post_data hpd USING(id)
            WHERE hp.counter_deleted = 0
              AND (
                    hp.block_num_created BETWEEN __blocks_range.first_block AND __blocks_range.last_block

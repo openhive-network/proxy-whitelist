@@ -48,8 +48,6 @@ AS $BODY$
                 if url is None:
                     continue
                 pipe.sadd('proxy:whitelist:urls', url)
-                pipe.sadd('proxy:whitelist:account_urls:{}'.format(author), url)
-                pipe.sadd('proxy:whitelist:url_accounts:{}'.format(url), author)
                 count += 1
 
             if count > 0:
