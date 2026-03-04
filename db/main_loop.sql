@@ -63,9 +63,9 @@ BEGIN
 END;
 $$;
 
--- Process profile images (avatars and covers) from all accounts.
--- Called periodically (every N batches) to pick up profile image changes.
-CREATE OR REPLACE FUNCTION proxy_whitelist_app.process_profile_images()
+-- Full-scan fallback: process profile images from ALL accounts.
+-- Kept for manual backfill/recovery. Use process_profile_images_incremental() for normal operation.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.process_profile_images_full_scan()
 RETURNS INT
 LANGUAGE plpgsql
 VOLATILE
@@ -111,7 +111,71 @@ BEGIN
         END IF;
     END LOOP;
 
-    RAISE NOTICE 'Profile images: whitelisted % URLs', __total;
+    RAISE NOTICE 'Profile images (full scan): whitelisted % URLs', __total;
+    RETURN __total;
+END;
+$$;
+
+-- Drop the old name if it exists (renamed to _full_scan above).
+DROP FUNCTION IF EXISTS proxy_whitelist_app.process_profile_images();
+
+-- Incremental profile image processing: only process accounts that had
+-- account_update or account_update2 operations in the given block range.
+-- Uses hafd.operations directly (not operations_view) for performance.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.process_profile_images_incremental(
+    _first_block INT, _last_block INT
+)
+RETURNS INT
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    __rec RECORD;
+    __urls TEXT[];
+    __resolved TEXT[];
+    __all_urls TEXT[];
+    __count INT := 0;
+    __total INT := 0;
+    __redis_url TEXT;
+BEGIN
+    SELECT redis_url INTO __redis_url FROM proxy_whitelist_app.app_status LIMIT 1;
+
+    FOR __rec IN
+        SELECT DISTINCT ha.name, ha.posting_json_metadata, ha.json_metadata
+        FROM hafd.operations ho
+        JOIN hivemind_app.hive_accounts ha
+            ON ha.name = (ho.body_binary::jsonb)->'value'->>'account'
+        WHERE hafd.operation_id_to_block_num(ho.id) BETWEEN _first_block AND _last_block
+          AND ho.op_type_id IN (10, 43)
+    LOOP
+        __urls := proxy_whitelist_app.extract_profile_urls(
+            __rec.posting_json_metadata, __rec.json_metadata
+        );
+        IF __urls IS NULL OR array_length(__urls, 1) IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        __all_urls := '{}';
+        FOR i IN 1..array_length(__urls, 1) LOOP
+            __resolved := proxy_whitelist_app.resolve_proxy_url(__urls[i]);
+            IF __resolved IS NOT NULL THEN
+                __all_urls := __all_urls || __resolved;
+            END IF;
+        END LOOP;
+
+        IF array_length(__all_urls, 1) IS NOT NULL THEN
+            __count := proxy_whitelist_app.redis_whitelist_urls(
+                __all_urls, __rec.name, __redis_url
+            );
+            __total := __total + __count;
+        END IF;
+    END LOOP;
+
+    IF __total > 0 THEN
+        RAISE NOTICE 'Profile images (blocks %-%) : whitelisted % URLs',
+            _first_block, _last_block, __total;
+    END IF;
+
     RETURN __total;
 END;
 $$;
@@ -309,11 +373,9 @@ DECLARE
     __ack_key_namespace             INT;
     __shard                         INT;
     __posts_per_chunk      CONSTANT INT := 2000;
-    __batch_counter                 INT := 0;
-    __poll_profile_every            INT;
 BEGIN
-    SELECT start_block, advisory_lock_namespace_begin, poll_profile_images_every_n_batches
-    INTO __start_block, __advisory_lock_namespace_begin, __poll_profile_every
+    SELECT start_block, advisory_lock_namespace_begin
+    INTO __start_block, __advisory_lock_namespace_begin
     FROM proxy_whitelist_app.app_status;
 
     __start_key_namespace := __advisory_lock_namespace_begin;
@@ -501,12 +563,10 @@ BEGIN
 
         TRUNCATE proxy_whitelist_app.block_tasks;
 
-        -- Periodically process profile images
-        __batch_counter := __batch_counter + 1;
-        IF __batch_counter % __poll_profile_every = 0 THEN
-            RAISE NOTICE 'Starting profile image scan (batch %)...', __batch_counter;
-            PERFORM proxy_whitelist_app.process_profile_images();
-        END IF;
+        -- Process profile images for accounts updated in this block range
+        PERFORM proxy_whitelist_app.process_profile_images_incremental(
+            __blocks_range.first_block, __blocks_range.last_block
+        );
 
     END LOOP;
 

@@ -20,7 +20,6 @@ print_help () {
     echo "  --redis-password=PASSWORD     Redis password (optional, for ACL auth)"
     echo "  --start_block=NUMBER         Start block to process (default: 1)"
     echo "  --parallel_workers=NUMBER    Number of parallel worker processes (default: 4)"
-    echo "  --poll-profile-every=NUMBER  Process profile images every N batches (default: 20)"
     echo "  --advisory-lock-namespace=NUMBER  Advisory lock namespace start (default: 20000)"
     echo "  --help                       Display this help screen and exit"
     echo
@@ -36,7 +35,6 @@ REDIS_URL='redis://localhost:6379'
 REDIS_PASSWORD=''
 PARALLEL_WORKERS=4
 START_BLOCK=1
-POLL_PROFILE_IMAGES_EVERY_N_BATCHES=20
 ADVISORY_LOCK_NAMESPACE_BEGIN=20000
 
 while [ $# -gt 0 ]; do
@@ -61,9 +59,6 @@ while [ $# -gt 0 ]; do
         ;;
     --parallel_workers=*)
         PARALLEL_WORKERS="${1#*=}"
-        ;;
-    --poll-profile-every=*)
-        POLL_PROFILE_IMAGES_EVERY_N_BATCHES="${1#*=}"
         ;;
     --advisory-lock-namespace=*)
         ADVISORY_LOCK_NAMESPACE_BEGIN="${1#*=}"
@@ -113,7 +108,6 @@ psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on -c "
   SET pg_temp.REDIS_URL TO '${REDIS_URL}';
   SET pg_temp.REDIS_PASSWORD TO '${REDIS_PASSWORD}';
   SET pg_temp.START_BLOCK TO ${START_BLOCK};
-  SET pg_temp.POLL_PROFILE_IMAGES_EVERY_N_BATCHES TO ${POLL_PROFILE_IMAGES_EVERY_N_BATCHES};
   SET pg_temp.ADVISORY_LOCK_NAMESPACE_BEGIN TO ${ADVISORY_LOCK_NAMESPACE_BEGIN};
   SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};
 " -f "$SRCPATH/db/database_schema.sql"

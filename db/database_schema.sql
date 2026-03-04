@@ -25,9 +25,12 @@ BEGIN
     redis_url TEXT NOT NULL DEFAULT 'redis://localhost:6379',
     redis_password TEXT,
     start_block INT NOT NULL DEFAULT 1,
-    poll_profile_images_every_n_batches INT NOT NULL DEFAULT 20,
     advisory_lock_namespace_begin INT NOT NULL DEFAULT 20000
   );
+
+  -- Migration: drop column from previous versions
+  ALTER TABLE proxy_whitelist_app.app_status
+    DROP COLUMN IF EXISTS poll_profile_images_every_n_batches;
 
   IF NOT hive.app_context_exists(__schema_name) THEN
     PERFORM hive.app_create_context(
@@ -75,7 +78,6 @@ INSERT INTO proxy_whitelist_app.app_status (
   redis_url,
   redis_password,
   start_block,
-  poll_profile_images_every_n_batches,
   advisory_lock_namespace_begin
 )
 VALUES (
@@ -85,7 +87,6 @@ VALUES (
   current_setting('PG_TEMP.REDIS_URL', TRUE)::TEXT,
   NULLIF(current_setting('PG_TEMP.REDIS_PASSWORD', TRUE), ''),
   current_setting('PG_TEMP.START_BLOCK', TRUE)::INT,
-  current_setting('PG_TEMP.POLL_PROFILE_IMAGES_EVERY_N_BATCHES', TRUE)::INT,
   current_setting('PG_TEMP.ADVISORY_LOCK_NAMESPACE_BEGIN', TRUE)::INT
 )
 ON CONFLICT (id)
