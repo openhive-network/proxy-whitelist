@@ -97,4 +97,4 @@ build_images:
 publish_images:
   extends: .docker_publish_job_template
   variables:
-    PUBLISH_IMAGES: "proxy-whitelist"
+    PUBLISH_IMAGES: "proxy-whitelist proxy-whitelist/postgrest-rewriter"

@@ -1,6 +1,6 @@
 SET ROLE proxy_whitelist_owner;
 
--- Process a batch of posts: extract image URLs, resolve proxy URLs, write to Redis.
+-- Process a batch of posts: extract image URLs, resolve proxy URLs, write to PostgreSQL.
 CREATE OR REPLACE FUNCTION proxy_whitelist_app.process_posts(
     _post_ids INT[],
     _worker INT
@@ -16,6 +16,7 @@ DECLARE
     __all_resolved TEXT[];
     __total INT := 0;
     __batch_count INT;
+    __local_account_id INT;
 BEGIN
     __batch_count := 0;
 
@@ -23,6 +24,7 @@ BEGIN
         SELECT hp.id AS post_id,
                hpd.body,
                hpd.json,
+               ha.id AS hive_account_id,
                ha.name AS author,
                hp.block_num
         FROM unnest(_post_ids) AS sel(id)
@@ -31,6 +33,9 @@ BEGIN
         JOIN hivemind_app.hive_accounts ha ON ha.id = hp.author_id
         WHERE hp.counter_deleted = 0
     LOOP
+        -- Ensure author exists in local accounts table
+        __local_account_id := proxy_whitelist_app.ensure_account(rec.hive_account_id, rec.author);
+
         -- Extract raw image URLs from body + json_metadata
         __urls := proxy_whitelist_app.extract_image_urls(rec.body, rec.json);
 
@@ -43,10 +48,10 @@ BEGIN
             END IF;
         END LOOP;
 
-        -- Write to Redis
+        -- Write to PostgreSQL
         IF array_length(__all_resolved, 1) > 0 THEN
-            __total := __total + proxy_whitelist_app.redis_whitelist_urls(
-                __all_resolved, rec.author
+            __total := __total + proxy_whitelist_app.whitelist_urls(
+                __all_resolved, __local_account_id
             );
         END IF;
 
@@ -76,9 +81,11 @@ DECLARE
     __resolved TEXT[];
     __all_resolved TEXT[];
     __total INT := 0;
+    __local_account_id INT;
 BEGIN
     FOR rec IN
-        SELECT ha.name,
+        SELECT ha.id AS hive_account_id,
+               ha.name,
                ha.posting_json_metadata,
                ha.json_metadata
         FROM hivemind_app.hive_accounts ha
@@ -95,6 +102,9 @@ BEGIN
             CONTINUE;
         END IF;
 
+        -- Ensure author exists in local accounts table
+        __local_account_id := proxy_whitelist_app.ensure_account(rec.hive_account_id, rec.name);
+
         -- Resolve each profile URL
         __all_resolved := ARRAY[]::TEXT[];
         FOR i IN 1..COALESCE(array_length(__profile_urls, 1), 0) LOOP
@@ -105,8 +115,8 @@ BEGIN
         END LOOP;
 
         IF array_length(__all_resolved, 1) > 0 THEN
-            __total := __total + proxy_whitelist_app.redis_whitelist_urls(
-                __all_resolved, rec.name
+            __total := __total + proxy_whitelist_app.whitelist_urls(
+                __all_resolved, __local_account_id
             );
         END IF;
     END LOOP;
@@ -136,12 +146,11 @@ DECLARE
     __all_urls TEXT[];
     __count INT := 0;
     __total INT := 0;
-    __redis_url TEXT;
+    __local_account_id INT;
 BEGIN
-    SELECT redis_url INTO __redis_url FROM proxy_whitelist_app.app_status LIMIT 1;
-
     FOR __rec IN
-        SELECT DISTINCT ha.name, ha.posting_json_metadata, ha.json_metadata
+        SELECT DISTINCT ha.id AS hive_account_id,
+               ha.name, ha.posting_json_metadata, ha.json_metadata
         FROM hafd.operations ho
         JOIN hivemind_app.hive_accounts ha
             ON ha.name = (ho.body_binary::jsonb)->'value'->>'account'
@@ -155,6 +164,9 @@ BEGIN
             CONTINUE;
         END IF;
 
+        -- Ensure author exists in local accounts table
+        __local_account_id := proxy_whitelist_app.ensure_account(__rec.hive_account_id, __rec.name);
+
         __all_urls := '{}';
         FOR i IN 1..array_length(__urls, 1) LOOP
             __resolved := proxy_whitelist_app.resolve_proxy_url(__urls[i]);
@@ -164,8 +176,8 @@ BEGIN
         END LOOP;
 
         IF array_length(__all_urls, 1) IS NOT NULL THEN
-            __count := proxy_whitelist_app.redis_whitelist_urls(
-                __all_urls, __rec.name, __redis_url
+            __count := proxy_whitelist_app.whitelist_urls(
+                __all_urls, __local_account_id
             );
             __total := __total + __count;
         END IF;
@@ -486,6 +498,7 @@ $$;
 
 
 -- Worker loop: claims tasks from block_tasks and processes them.
+-- Legacy code kept for future parallel processing support.
 CREATE OR REPLACE PROCEDURE proxy_whitelist_app.worker_loop(
     IN _worker            INT,
     IN _app_context_name  hive.context_name,
@@ -545,8 +558,6 @@ BEGIN
                     __task.post_ids, _worker
                 );
             EXCEPTION WHEN OTHERS THEN
-                -- Redis or other transient error: rollback this task,
-                -- it reverts to 'pending' and can be retried.
                 RAISE WARNING 'worker % task % failed: %, retrying after delay',
                               _worker, __task.task_id, SQLERRM;
                 ROLLBACK;
