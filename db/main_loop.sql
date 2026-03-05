@@ -432,14 +432,14 @@ BEGIN
         END IF;
 
         -- Wait for hivemind to process through this range (read-only loop)
-        -- Use last_block + 1 to ensure hivemind has fully committed all data
-        -- for the last block (its block pointer advances after commit).
+        -- hivemind's current_block_num advances to N after committing block N's data,
+        -- so >= is safe (data is visible when the pointer reaches that block).
         __hivemind_wait_start := clock_timestamp();
         LOOP
             SELECT hive.app_get_current_block_num('hivemind_app')
               INTO __hivemind_current_block;
 
-            EXIT WHEN __hivemind_current_block > __planned_range.last_block;
+            EXIT WHEN __hivemind_current_block >= __planned_range.last_block;
 
             IF clock_timestamp() - __hivemind_wait_start > __hivemind_wait_timeout THEN
                 RAISE NOTICE 'Hivemind wait timeout after % for block % (hivemind at %). Re-requesting range.',
