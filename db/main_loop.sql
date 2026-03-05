@@ -373,6 +373,8 @@ DECLARE
     __ack_key_namespace             INT;
     __shard                         INT;
     __posts_per_chunk      CONSTANT INT := 2000;
+    __hivemind_wait_start           TIMESTAMPTZ;
+    __hivemind_wait_timeout CONSTANT INTERVAL := '300 seconds';
 BEGIN
     SELECT start_block, advisory_lock_namespace_begin
     INTO __start_block, __advisory_lock_namespace_begin
@@ -406,6 +408,7 @@ BEGIN
 
     RAISE NOTICE 'Entering scheduler main loop...';
 
+    <<main_loop>>
     LOOP
         -- Wait for start block
         IF NOT proxy_whitelist_app.wait_for_start_block(__start_block, 1, __context_name) THEN
@@ -431,11 +434,19 @@ BEGIN
         -- Wait for hivemind to process through this range (read-only loop)
         -- Use last_block + 1 to ensure hivemind has fully committed all data
         -- for the last block (its block pointer advances after commit).
+        __hivemind_wait_start := clock_timestamp();
         LOOP
             SELECT hive.app_get_current_block_num('hivemind_app')
               INTO __hivemind_current_block;
 
             EXIT WHEN __hivemind_current_block > __planned_range.last_block;
+
+            IF clock_timestamp() - __hivemind_wait_start > __hivemind_wait_timeout THEN
+                RAISE NOTICE 'Hivemind wait timeout after % for block % (hivemind at %). Re-requesting range.',
+                             __hivemind_wait_timeout, __planned_range.last_block, __hivemind_current_block;
+                COMMIT;
+                CONTINUE main_loop;
+            END IF;
 
             RAISE NOTICE 'Waiting for hivemind to reach block % (at %)',
                          __planned_range.last_block,
@@ -471,22 +482,12 @@ BEGIN
             CONTINUE;
         END IF;
 
-        -- Wait for hivemind again (in transaction)
-        LOOP
-            SELECT hive.app_get_current_block_num('hivemind_app')
-              INTO __hivemind_current_block;
-            EXIT WHEN __hivemind_current_block > __blocks_range.last_block;
-            RAISE NOTICE 'Waiting for hivemind to reach block % (at %) [in tx]',
-                         __blocks_range.last_block,
-                         __hivemind_current_block;
-            PERFORM pg_sleep(1);
-            __breaking_reason := proxy_whitelist_app.isBreakingPending(
-                __context_name, _max_block_limit, NULL
-            );
-            IF __breaking_reason IS NOT NULL THEN
-                RETURN;
-            END IF;
-        END LOOP;
+        -- No second hivemind wait needed: the first wait already confirmed
+        -- hivemind is past last_block, and hivemind never goes backwards.
+        -- (A wait loop here would be dangerous anyway — inside a transaction,
+        -- READ COMMITTED snapshots are per-statement but the snapshot taken
+        -- by app_next_iteration's transaction would make reads of
+        -- hafd.contexts return stale values, causing an infinite loop.)
 
         -- Build task batches from posts in this block range
         __batch_id := nextval('proxy_whitelist_app.batch_seq');
