@@ -350,7 +350,8 @@ END;
 $$;
 
 
--- Scheduler: receives block ranges from HAF, waits for hivemind, distributes tasks.
+-- Single-threaded block processor: gets ranges from HAF, waits for hivemind,
+-- processes posts directly. No workers, no advisory locks.
 CREATE OR REPLACE PROCEDURE proxy_whitelist_app.scheduler(
     IN  _app_context_base_name  hive.context_name,
     IN  _workers                INT,
@@ -364,37 +365,13 @@ DECLARE
     __start_block                   INT := 0;
     __blocks_range                  hive.blocks_range := (0,0);
     __planned_range                 hive.blocks_range;
-    __batch_id                      BIGINT;
-    __todo                          INT;
     __breaking_reason               TEXT := null;
-    __advisory_lock_namespace_begin INT;
-    __start_key_namespace           INT;
-    __done_key_namespace            INT;
-    __ack_key_namespace             INT;
-    __shard                         INT;
-    __posts_per_chunk      CONSTANT INT := 2000;
+    __done                          INT;
     __hivemind_wait_start           TIMESTAMPTZ;
     __hivemind_wait_timeout CONSTANT INTERVAL := '300 seconds';
 BEGIN
-    SELECT start_block, advisory_lock_namespace_begin
-    INTO __start_block, __advisory_lock_namespace_begin
+    SELECT start_block INTO __start_block
     FROM proxy_whitelist_app.app_status;
-
-    __start_key_namespace := __advisory_lock_namespace_begin;
-    __done_key_namespace := __advisory_lock_namespace_begin + 1;
-    __ack_key_namespace := __advisory_lock_namespace_begin + 2;
-
-    -- Acquire start_key and ack_key for all workers so they block
-    FOR __shard IN 1.._workers LOOP
-        PERFORM pg_advisory_lock(__start_key_namespace, __shard);
-        PERFORM pg_advisory_lock(__ack_key_namespace, __shard);
-    END LOOP;
-
-    RAISE NOTICE 'Scheduler: start_keys locked for % workers; entering main loop...', _workers;
-
-    IF _max_block_limit IS NOT NULL THEN
-        RAISE NOTICE 'Max block limit: %', _max_block_limit;
-    END IF;
 
     PERFORM proxy_whitelist_app.allowProcessing();
 
@@ -402,11 +379,15 @@ BEGIN
                  __context_name,
                  hive.app_get_current_block_num(__context_name);
 
+    IF _max_block_limit IS NOT NULL THEN
+        RAISE NOTICE 'Max block limit: %', _max_block_limit;
+    END IF;
+
     IF hive.app_get_current_block_num(__context_name) < __start_block - 1 THEN
         PERFORM hive.app_set_current_block_num(__context_name, __start_block - 1);
     END IF;
 
-    RAISE NOTICE 'Entering scheduler main loop...';
+    RAISE NOTICE 'Entering main loop...';
 
     <<main_loop>>
     LOOP
@@ -482,88 +463,10 @@ BEGIN
             CONTINUE;
         END IF;
 
-        -- No second hivemind wait needed: the first wait already confirmed
-        -- hivemind is past last_block, and hivemind never goes backwards.
-        -- (A wait loop here would be dangerous anyway — inside a transaction,
-        -- READ COMMITTED snapshots are per-statement but the snapshot taken
-        -- by app_next_iteration's transaction would make reads of
-        -- hafd.contexts return stale values, causing an infinite loop.)
-
-        -- Build task batches from posts in this block range
-        __batch_id := nextval('proxy_whitelist_app.batch_seq');
-        WITH posts AS (
-          SELECT hp.id AS post_id,
-                 GREATEST(hp.block_num_created, hp.block_num) AS blk
-            FROM hivemind_app.hive_posts hp
-           WHERE hp.counter_deleted = 0
-             AND (
-                   hp.block_num_created BETWEEN __blocks_range.first_block AND __blocks_range.last_block
-                OR hp.block_num          BETWEEN __blocks_range.first_block AND __blocks_range.last_block
-             )
-        ),
-        numbered AS (
-          SELECT post_id, blk,
-                 ROW_NUMBER() OVER (ORDER BY blk) AS rn
-          FROM posts
-        ),
-        chunked AS (
-          SELECT post_id, blk,
-                 ((rn - 1) / __posts_per_chunk)::INT AS chunk_idx
-          FROM numbered
-        ),
-        grouped AS (
-          SELECT chunk_idx,
-                 ARRAY_AGG(post_id ORDER BY post_id) AS pids,
-                 MIN(blk) AS first_blk,
-                 MAX(blk) AS last_blk
-          FROM chunked
-          GROUP BY chunk_idx
-        )
-        INSERT INTO proxy_whitelist_app.block_tasks(
-            batch_id, shard, post_ids, first_block, last_block
-        )
-        SELECT __batch_id, NULL, pids, first_blk, last_blk
-        FROM grouped;
-
-        -- Upsert processed_posts for tracking
-        INSERT INTO proxy_whitelist_app.processed_posts (post_id, last_block_num)
-        SELECT id, -1
-        FROM (
-            SELECT DISTINCT UNNEST(post_ids) AS id
-            FROM proxy_whitelist_app.block_tasks
-            WHERE batch_id = __batch_id
-        ) AS src
-        ORDER BY id
-        ON CONFLICT (post_id) DO NOTHING;
-
-        COMMIT;  -- let workers see tasks
-
-        -- Wake all workers
-        FOR __shard IN 1.._workers LOOP
-            PERFORM pg_advisory_unlock(__start_key_namespace, __shard);
-        END LOOP;
-
-        -- Wait for each worker to finish
-        FOR __shard IN 1.._workers LOOP
-            CALL proxy_whitelist_app.wait_for_advisory_lock(__done_key_namespace, __shard);
-            PERFORM pg_advisory_unlock(__done_key_namespace, __shard);
-            PERFORM pg_advisory_unlock(__ack_key_namespace, __shard);
-            PERFORM pg_advisory_lock(__ack_key_namespace, __shard);
-            PERFORM pg_advisory_lock(__start_key_namespace, __shard);
-        END LOOP;
-
-        -- Verify all tasks done
-        LOOP
-            SELECT COUNT(*) INTO __todo
-            FROM proxy_whitelist_app.block_tasks
-            WHERE batch_id = __batch_id
-              AND status <> 'done';
-
-            EXIT WHEN __todo = 0;
-            PERFORM pg_sleep(0.1);
-        END LOOP;
-
-        TRUNCATE proxy_whitelist_app.block_tasks;
+        -- Process posts directly (no worker dispatch)
+        CALL proxy_whitelist_app.process_blocks(
+            __context_name, __blocks_range, 1, __done
+        );
 
         -- Process profile images for accounts updated in this block range
         BEGIN

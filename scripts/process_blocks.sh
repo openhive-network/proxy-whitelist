@@ -5,7 +5,7 @@ set -o pipefail
 print_help () {
     echo "Usage: $0 [OPTION[=VALUE]]..."
     echo
-    echo "Starts the proxy_whitelist block processing (scheduler + workers)."
+    echo "Starts the proxy_whitelist block processing."
     echo "OPTIONS:"
     echo "  --host=VALUE         PostgreSQL host (defaults to localhost)"
     echo "  --port=NUMBER        PostgreSQL port (defaults to 5432)"
@@ -66,51 +66,7 @@ postgres_access(){
   echo "${POSTGRES_URL:-"postgresql://$POSTGRES_USER@$POSTGRES_HOST:$POSTGRES_PORT/haf_block_log?application_name=$1"}"
 }
 
-NUMBER_OF_WORKERS="$(psql "$(postgres_access proxy_whitelist_block_processing)" -v "ON_ERROR_STOP=on" -t -c "SELECT parallel_workers FROM ${PROXY_WHITELIST_SCHEMA}.app_status" | xargs)"
-
-echo "Starting proxy_whitelist with ${NUMBER_OF_WORKERS} workers..."
-
-launch_worker() {
-    local n_blocks="${2:-null}"
-    local worker=${1}
-
-    trap '' SIGINT SIGTERM
-
-    setsid bash <<EOF
-    psql "$(postgres_access "proxy_whitelist_worker_${worker}")" \
-      -v ON_ERROR_STOP=on \
-      -c "\\timing" \
-      -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
-      -c "CALL ${PROXY_WHITELIST_SCHEMA}.worker_loop(${worker}, '${PROXY_WHITELIST_SCHEMA}', ${n_blocks});" \
-    || \
-    psql "$(postgres_access "proxy_whitelist_worker_${worker}")" \
-      -v ON_ERROR_STOP=on \
-      -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
-      -c "SELECT ${PROXY_WHITELIST_SCHEMA}.stopProcessing();"
-EOF
-    echo "Worker ${worker} stopped"
-}
-
-launch_scheduler() {
-    local n_blocks="${2:-null}"
-    local num_workers=${1}
-
-    trap '' SIGINT SIGTERM
-
-    setsid bash <<EOF
-    psql "$(postgres_access proxy_whitelist_scheduler)" \
-      -v ON_ERROR_STOP=on \
-      -c "\\timing" \
-      -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
-      -c "CALL ${PROXY_WHITELIST_SCHEMA}.scheduler('${PROXY_WHITELIST_SCHEMA}', ${num_workers}, ${n_blocks});" \
-    || \
-    psql "$(postgres_access proxy_whitelist_scheduler)" \
-      -v ON_ERROR_STOP=on \
-      -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
-      -c "SELECT ${PROXY_WHITELIST_SCHEMA}.stopProcessing();"
-EOF
-    echo "Scheduler stopped"
-}
+echo "Starting proxy_whitelist..."
 
 # Record startup time for health checks
 date -uIseconds > /tmp/proxy_whitelist_startup_time.txt
@@ -128,21 +84,17 @@ while true; do
     sleep 5
 done
 
-launch_scheduler "$NUMBER_OF_WORKERS" "$PROCESS_BLOCK_LIMIT" &
+# Single-threaded: scheduler processes blocks directly, no worker processes needed.
+# The _workers parameter is kept for API compatibility but ignored.
+psql "$(postgres_access proxy_whitelist_scheduler)" \
+  -v ON_ERROR_STOP=on \
+  -c "\timing" \
+  -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
+  -c "CALL ${PROXY_WHITELIST_SCHEMA}.scheduler('${PROXY_WHITELIST_SCHEMA}', 0, ${PROCESS_BLOCK_LIMIT});" \
+|| \
+psql "$(postgres_access proxy_whitelist_scheduler)" \
+  -v ON_ERROR_STOP=on \
+  -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
+  -c "SELECT ${PROXY_WHITELIST_SCHEMA}.stopProcessing();"
 
-i=1
-while [ "$i" -le "$NUMBER_OF_WORKERS" ]; do
-    launch_worker "$i" "$PROCESS_BLOCK_LIMIT" &
-    i=$((i + 1))
-done
-
-terminate_jobs() {
-    echo "Stopping proxy_whitelist workers..."
-    psql "$(postgres_access proxy_whitelist_breaker)" -v "ON_ERROR_STOP=on" -t \
-      -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA}; SELECT ${PROXY_WHITELIST_SCHEMA}.stopProcessing();"
-    wait
-}
-
-trap 'terminate_jobs' INT TERM
-
-wait
+echo "Scheduler stopped"
