@@ -12,23 +12,25 @@ AS $BODY$
 
     urls = set()
     IMAGE_RE = re.compile(
-        r'https?://[^\s\)\]"<>]+\.(?:tiff?|jpe?g|gif|png|svg|ico|webp)(?:\?[^\s\)\]"<>]*)?',
+        r'https?://[^\s\)\]"<>]+\.(?:tiff?|jpe?g|gif|png|svg|ico|webp|heic|heif|jfif|bmp|avif|apng)(?:\?[^\s\)\]"<>]*)?',
         re.IGNORECASE
     )
+    HTTP_RE = re.compile(r'^https?://', re.IGNORECASE)
 
-    # Extract from body
+    # Extract from body (regex filter — only known image extensions)
     if body:
         for m in IMAGE_RE.finditer(body):
             urls.add(m.group(0))
 
     # Extract from json_metadata 'image' array
+    # Trust the posting app: any HTTP URL in the image array is an image
     if json_metadata:
         try:
             meta = json.loads(json_metadata)
             if not isinstance(meta, dict):
                 return list(urls)
             for img in meta.get('image', []):
-                if isinstance(img, str) and IMAGE_RE.match(img):
+                if isinstance(img, str) and HTTP_RE.match(img):
                     urls.add(img)
         except (json.JSONDecodeError, TypeError, AttributeError):
             pass
