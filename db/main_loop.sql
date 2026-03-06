@@ -425,10 +425,19 @@ BEGIN
         END IF;
 
         -- Wait for hivemind to fully process through this range.
-        -- We check last_completed_block_num (not app_get_current_block_num)
-        -- because hivemind commits hive_posts and hive_post_data in separate
-        -- transactions. last_completed_block_num is only updated after ALL
-        -- phases (posts, post_data, notifications) are committed and visible.
+        --
+        -- In live mode, hivemind updates last_completed_block_num AFTER all
+        -- phases (hive_posts, hive_post_data, notifications) are committed.
+        -- This is the safe signal that all data for the block is visible.
+        --
+        -- In massive sync mode, last_completed_block_num is NOT updated
+        -- (it stays at the pre-massive-sync value until finalization).
+        -- We detect this by checking if app_get_current_block_num is far
+        -- ahead of last_completed_block_num, and fall back to
+        -- app_get_current_block_num in that case. The multi-transaction
+        -- race is harmless during massive sync because we trail hivemind
+        -- by many batches, so PostDataCache.flush() has long since
+        -- committed by the time we read a block's data.
         __hivemind_wait_start := clock_timestamp();
         LOOP
             COMMIT;  -- fresh snapshot each iteration
@@ -437,7 +446,15 @@ BEGIN
               INTO __hivemind_current_block
               FROM hivemind_app.hive_state;
 
+            -- If last_completed is current enough, use it (live mode)
             EXIT WHEN __hivemind_current_block >= __planned_range.last_block;
+
+            -- Massive sync fallback: last_completed is stale but
+            -- app_get_current_block_num is well past our target.
+            -- The 1000-block margin ensures PostDataCache has flushed.
+            EXIT WHEN hive.app_get_current_block_num('hivemind_app')
+                      >= __planned_range.last_block + 1000
+                  AND __hivemind_current_block < hive.app_get_current_block_num('hivemind_app') - 10000;
 
             IF clock_timestamp() - __hivemind_wait_start > __hivemind_wait_timeout THEN
                 RAISE NOTICE 'Hivemind wait timeout after % for block % (hivemind at %). Re-requesting range.',
