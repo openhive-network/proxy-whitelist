@@ -424,27 +424,30 @@ BEGIN
             CONTINUE;
         END IF;
 
-        -- Wait for hivemind to process through this range (read-only loop)
-        -- hivemind's current_block_num advances to N after committing block N's data,
-        -- so >= is safe (data is visible when the pointer reaches that block).
+        -- Wait for hivemind to fully process through this range.
+        -- We check last_completed_block_num (not app_get_current_block_num)
+        -- because hivemind commits hive_posts and hive_post_data in separate
+        -- transactions. last_completed_block_num is only updated after ALL
+        -- phases (posts, post_data, notifications) are committed and visible.
         __hivemind_wait_start := clock_timestamp();
         LOOP
-            SELECT hive.app_get_current_block_num('hivemind_app')
-              INTO __hivemind_current_block;
+            COMMIT;  -- fresh snapshot each iteration
+
+            SELECT last_completed_block_num
+              INTO __hivemind_current_block
+              FROM hivemind_app.hive_state;
 
             EXIT WHEN __hivemind_current_block >= __planned_range.last_block;
 
             IF clock_timestamp() - __hivemind_wait_start > __hivemind_wait_timeout THEN
                 RAISE NOTICE 'Hivemind wait timeout after % for block % (hivemind at %). Re-requesting range.',
                              __hivemind_wait_timeout, __planned_range.last_block, __hivemind_current_block;
-                COMMIT;
                 CONTINUE main_loop;
             END IF;
 
             RAISE NOTICE 'Waiting for hivemind to reach block % (at %)',
                          __planned_range.last_block,
                          __hivemind_current_block;
-            COMMIT;
             PERFORM pg_sleep(1);
 
             __breaking_reason := proxy_whitelist_app.isBreakingPending(
