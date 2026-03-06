@@ -35,17 +35,18 @@ BEGIN
         RETURN 0;
     END IF;
 
-    -- Batch insert URLs (text stored once)
+    -- Batch insert URLs (text stored once, md5 expression index for uniqueness)
     INSERT INTO proxy_whitelist_app.urls (url)
     SELECT DISTINCT u FROM unnest(_urls) AS u
     WHERE u IS NOT NULL
-    ON CONFLICT (url) DO NOTHING;
+    ON CONFLICT ((md5(url))) DO NOTHING;
 
     -- Batch insert author associations (integer IDs only)
+    -- Join via md5 to use the expression index on urls(md5(url))
     INSERT INTO proxy_whitelist_app.url_authors (url_id, author_id)
     SELECT u.id, _author_id
-    FROM proxy_whitelist_app.urls u
-    WHERE u.url = ANY(_urls)
+    FROM unnest(_urls) AS input_url
+    JOIN proxy_whitelist_app.urls u ON md5(u.url) = md5(input_url) AND u.url = input_url
     ON CONFLICT DO NOTHING;
 
     GET DIAGNOSTICS __count = ROW_COUNT;

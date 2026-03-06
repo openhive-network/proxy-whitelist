@@ -8,7 +8,7 @@ STABLE
 AS $$
     SELECT EXISTS(
         SELECT 1 FROM proxy_whitelist_app.urls u
-        WHERE u.url = is_whitelisted.url
+        WHERE md5(u.url) = md5(is_whitelisted.url) AND u.url = is_whitelisted.url
     );
 $$;
 
@@ -20,7 +20,7 @@ AS $$
     SELECT EXISTS(
         SELECT 1 FROM proxy_whitelist_app.blacklisted_urls bu
         JOIN proxy_whitelist_app.urls u ON u.id = bu.url_id
-        WHERE u.url = is_url_blacklisted.url
+        WHERE md5(u.url) = md5(is_url_blacklisted.url) AND u.url = is_url_blacklisted.url
     );
 $$;
 

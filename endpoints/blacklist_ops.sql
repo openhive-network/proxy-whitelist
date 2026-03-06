@@ -23,7 +23,7 @@ AS $$
     FROM proxy_whitelist_app.url_authors ua
     JOIN proxy_whitelist_app.urls u ON u.id = ua.url_id
     JOIN proxy_whitelist_app.accounts a ON a.id = ua.author_id
-    WHERE u.url = url_accounts.url;
+    WHERE md5(u.url) = md5(url_accounts.url) AND u.url = url_accounts.url;
 $$;
 
 GRANT EXECUTE ON FUNCTION proxy_whitelist_endpoints.account_urls(TEXT)

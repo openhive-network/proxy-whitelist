@@ -69,10 +69,16 @@ BEGIN
 
   -- URL dictionary: text stored exactly once, referenced by integer ID everywhere else.
   -- Existence in this table = whitelisted.
+  -- Uniqueness enforced via md5 expression index (btree UNIQUE fails for URLs >8KB).
   CREATE TABLE IF NOT EXISTS proxy_whitelist_app.urls (
     id BIGSERIAL PRIMARY KEY,
-    url TEXT NOT NULL UNIQUE
+    url TEXT NOT NULL
   );
+
+  -- Migration: replace btree UNIQUE on url text (fails for >8KB URLs) with md5 expression index
+  ALTER TABLE proxy_whitelist_app.urls DROP CONSTRAINT IF EXISTS urls_url_key;
+  CREATE UNIQUE INDEX IF NOT EXISTS urls_url_md5_idx
+    ON proxy_whitelist_app.urls (md5(url));
 
   -- Author-URL associations: two integers per row (~12 bytes vs ~120 bytes with TEXT)
   CREATE TABLE IF NOT EXISTS proxy_whitelist_app.url_authors (
