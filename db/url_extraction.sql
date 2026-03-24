@@ -64,10 +64,16 @@ AS $BODY$
         try:
             import base58
             decoded = base58.b58decode(m.group(1))
-            # Strip multihash prefix (first 2 bytes) if present
             if len(decoded) > 2:
-                inner = decoded[2:].decode('utf-8', errors='replace')
-                result.add(inner)
+                raw = decoded.decode('utf-8', errors='replace')
+                if raw.startswith('http'):
+                    # Plain base58 encoding (no multihash prefix)
+                    result.add(raw)
+                else:
+                    # Multihash-prefixed encoding: strip 2-byte prefix
+                    inner = decoded[2:].decode('utf-8', errors='replace')
+                    if inner.startswith('http'):
+                        result.add(inner)
         except Exception:
             pass
         return list(result)
