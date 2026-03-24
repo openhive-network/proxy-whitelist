@@ -16,9 +16,17 @@ AS $BODY$
         re.IGNORECASE
     )
     HTTP_RE = re.compile(r'^https?://', re.IGNORECASE)
+    IMG_SRC_RE = re.compile(
+        r'<img\s[^>]*?src\s*=\s*["\']?(https?://[^\s"\'<>]+)',
+        re.IGNORECASE
+    )
 
-    # Extract from body (regex filter — only known image extensions)
+    # Extract from body
     if body:
+        # URLs in <img> tags are images by definition, regardless of extension
+        for m in IMG_SRC_RE.finditer(body):
+            urls.add(m.group(1))
+        # Also scan for bare URLs with known image extensions (markdown, etc.)
         for m in IMAGE_RE.finditer(body):
             urls.add(m.group(0))
 
