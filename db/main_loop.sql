@@ -153,7 +153,7 @@ BEGIN
                ha.name, ha.posting_json_metadata, ha.json_metadata
         FROM hafd.operations ho
         JOIN hivemind_app.hive_accounts ha
-            ON ha.name = (ho.body_binary::jsonb)->'value'->>'account'
+            ON ha.name = ho.body_value->>'account'
         WHERE hafd.operation_id_to_block_num(ho.id) BETWEEN _first_block AND _last_block
           AND ho.op_type_id IN (10, 43)
     LOOP
