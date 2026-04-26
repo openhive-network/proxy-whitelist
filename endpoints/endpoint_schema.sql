@@ -66,9 +66,9 @@ DO $__$
     "/whitelist/check": {
       "post": {
         "tags": ["Whitelist"],
-        "summary": "Check if a URL is whitelisted",
-        "description": "Returns true if the URL exists in the whitelist (has been referenced in a Hive post).",
-        "operationId": "proxy_whitelist_endpoints.is_whitelisted",
+        "summary": "Check whitelist/blacklist status of a URL",
+        "description": "Returns 'blacklisted' if the URL is on the permanent URL blacklist, 'whitelisted' if it has been referenced in a Hive post, or 'unknown' otherwise. If blacklisted_accounts is supplied, a URL whose only authors are all in that list is reported as 'unknown' for this caller (lets each caller apply its own per-account blacklist without storing operator-specific state in the database).",
+        "operationId": "proxy_whitelist_endpoints.check_url",
         "requestBody": {
           "required": true,
           "content": {
@@ -80,6 +80,11 @@ DO $__$
                   "url": {
                     "type": "string",
                     "description": "The URL to check"
+                  },
+                  "blacklisted_accounts": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional list of Hive account names to treat as blacklisted for this call. URLs whose authors are all in this list are returned as 'unknown'."
                   }
                 }
               }
@@ -88,10 +93,13 @@ DO $__$
         },
         "responses": {
           "200": {
-            "description": "Boolean result",
+            "description": "One of 'blacklisted', 'whitelisted', or 'unknown'.",
             "content": {
               "application/json": {
-                "schema": { "type": "boolean" }
+                "schema": {
+                  "type": "string",
+                  "enum": ["blacklisted", "whitelisted", "unknown"]
+                }
               }
             }
           }
