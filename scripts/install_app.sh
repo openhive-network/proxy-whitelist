@@ -89,7 +89,7 @@ POSTGRES_ACCESS=${POSTGRES_URL:-"postgresql://$POSTGRES_USER@$POSTGRES_HOST:$POS
 # script.
 if [[ -z "${HAF_INSTALL_LOCK_HELD:-}" ]]; then
   export HAF_INSTALL_LOCK_HELD=1
-  exec /usr/local/bin/install_with_app_lock.py proxy-whitelist "$POSTGRES_ACCESS" "$0" "${ORIGINAL_ARGS[@]}"
+  exec python3 /usr/local/bin/install_with_app_lock.py proxy-whitelist "$POSTGRES_ACCESS" "$0" "${ORIGINAL_ARGS[@]}"
 fi
 
 echo "Installing proxy_whitelist app..."
