@@ -6,6 +6,9 @@ set -o pipefail
 SCRIPTPATH="$( cd -- "$(dirname "$0")" >/dev/null 2>&1 || exit 1; pwd -P )"
 SRCPATH="${SCRIPTPATH}/../"
 
+# Capture original args for the install-lock re-exec below.
+ORIGINAL_ARGS=("$@")
+
 echo "All arguments: $*"
 
 print_help () {
@@ -77,6 +80,17 @@ while [ $# -gt 0 ]; do
 done
 
 POSTGRES_ACCESS=${POSTGRES_URL:-"postgresql://$POSTGRES_USER@$POSTGRES_HOST:$POSTGRES_PORT/haf_block_log?application_name=${POSTGRES_APP_NAME}"}
+
+# Re-exec under the install-lock wrapper if not already running under it.
+# The wrapper holds an exclusive advisory lock on `proxy-whitelist` for the
+# lifetime of this script, preventing a block-processor from running
+# concurrently against the in-progress schema. If a BP is already holding the
+# shared lock, the wrapper logs the holder and exits 0 without invoking this
+# script.
+if [[ -z "${HAF_INSTALL_LOCK_HELD:-}" ]]; then
+  export HAF_INSTALL_LOCK_HELD=1
+  exec /usr/local/bin/install_with_app_lock.py proxy-whitelist "$POSTGRES_ACCESS" "$0" "${ORIGINAL_ARGS[@]}"
+fi
 
 echo "Installing proxy_whitelist app..."
 echo "Number of workers: ${PARALLEL_WORKERS}"

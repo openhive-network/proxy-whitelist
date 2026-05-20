@@ -382,6 +382,10 @@ DECLARE
     __hivemind_wait_start           TIMESTAMPTZ;
     __hivemind_wait_timeout CONSTANT INTERVAL := '300 seconds';
 BEGIN
+    -- Block until any active hivemind/proxy-whitelist installer releases its
+    -- exclusive lock; held by this session until the scheduler returns.
+    PERFORM hive.acquire_app_block_processor_locks(ARRAY['hivemind', 'proxy-whitelist']);
+
     SELECT start_block INTO __start_block
     FROM proxy_whitelist_app.app_status;
 
