@@ -152,6 +152,10 @@ psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
   -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
   -f "$SRCPATH/endpoints/blacklist_ops.sql"
 
+psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
+  -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
+  -f "$SRCPATH/endpoints/sync_status.sql"
+
 # Grant permissions
 psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
   -c "SET ROLE proxy_whitelist_owner; GRANT USAGE ON SCHEMA ${PROXY_WHITELIST_SCHEMA} TO proxy_whitelist_user;"

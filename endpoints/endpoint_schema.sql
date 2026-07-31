@@ -19,6 +19,8 @@ tags:
     description: URL whitelist and blacklist checks
   - name: Accounts
     description: Account-URL relationship queries
+  - name: Other
+    description: General API information
 servers:
   - url: /proxy-whitelist-api
  */
@@ -55,6 +57,10 @@ DO $__$
     {
       "name": "Accounts",
       "description": "Account-URL relationship queries"
+    },
+    {
+      "name": "Other",
+      "description": "General API information"
     }
   ],
   "servers": [
@@ -209,6 +215,41 @@ DO $__$
                       "account": { "type": "string" }
                     }
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sync-status": {
+      "get": {
+        "tags": ["Other"],
+        "summary": "Get proxy whitelist's sync status",
+        "description": "Get the last block processed by the proxy whitelist app as an object containing both the block number and its timestamp (UTC). This is the uniform HAF-app sync/health endpoint: the timestamp lets a consumer compute staleness with a single call (age = now() - last_block_time) without needing a separate head-block reference.",
+        "operationId": "proxy_whitelist_endpoints.sync_status",
+        "responses": {
+          "200": {
+            "description": "Last block processed and its timestamp. last_block_time is null if no block has been processed yet.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "last_block_num": {
+                      "type": "integer",
+                      "description": "highest block number processed by the app"
+                    },
+                    "last_block_time": {
+                      "type": "string",
+                      "format": "date-time",
+                      "description": "UTC timestamp of that block"
+                    }
+                  }
+                },
+                "example": {
+                  "last_block_num": 5000000,
+                  "last_block_time": "2016-09-15T19:47:21"
                 }
               }
             }
