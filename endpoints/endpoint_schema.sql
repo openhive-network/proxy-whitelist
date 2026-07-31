@@ -230,7 +230,7 @@ DO $__$
         "operationId": "proxy_whitelist_endpoints.sync_status",
         "responses": {
           "200": {
-            "description": "Last block processed and its timestamp. last_block_time is null if no block has been processed yet.",
+            "description": "Last block processed and its timestamp. last_block_time is null if no block has been processed yet. While the HAF instance is still in massive sync (indexes not yet built) the call fails fast with an error rather than executing an unindexed lookup.",
             "content": {
               "application/json": {
                 "schema": {
