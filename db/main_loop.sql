@@ -521,6 +521,43 @@ END
 $$;
 
 
+-- ============================================================================
+-- GENERIC DRIVER ENTRY POINT AND APPLICATION REGISTRY (haf#341)
+-- ============================================================================
+-- Entry point for the generic HAF block-processing driver (haf_app_driver.py):
+-- processes one range delivered by hive.app_next_iteration. The driver owns the
+-- transaction, so this must not COMMIT. Waiting for hivemind is no longer done
+-- here: the application is registered as depending on hivemind_app, so
+-- hive.app_next_iteration never delivers a block hivemind has not committed
+-- (hivemind reports its committed position through its completed-block
+-- function, which is exact during massive sync as well).
+CREATE OR REPLACE PROCEDURE proxy_whitelist_app.process_blocks( _block_range hive.blocks_range )
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    __done INT;
+BEGIN
+    CALL proxy_whitelist_app.process_blocks( 'proxy_whitelist_app', _block_range, 1, __done );
+
+    -- Process profile images for accounts updated in this block range
+    BEGIN
+        PERFORM proxy_whitelist_app.process_profile_images_incremental(
+            _block_range.first_block, _block_range.last_block
+        );
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'Profile image processing failed for blocks %-%, will retry next cycle: %',
+                      _block_range.first_block, _block_range.last_block, SQLERRM;
+    END;
+END
+$$;
+
+-- Register with the HAF application registry (driver entry point above) and
+-- declare the dependency on hivemind, which must already be registered (the
+-- hivemind install runs first).
+SELECT hive.app_register( 'proxy_whitelist_app', ARRAY[ 'proxy_whitelist_app' ]::hive.contexts_group, 'proxy_whitelist_app.process_blocks' );
+SELECT hive.app_add_dependency( 'proxy_whitelist_app', 'hivemind_app' );
+
+
 -- Worker loop: claims tasks from block_tasks and processes them.
 -- Legacy code kept for future parallel processing support.
 CREATE OR REPLACE PROCEDURE proxy_whitelist_app.worker_loop(

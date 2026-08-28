@@ -134,10 +134,24 @@ psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
   -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
   -f "$SRCPATH/db/url_extraction.sql"
 
-# Install main loop (scheduler + workers)
+# Install main loop (scheduler + workers, driver entry point + registration)
 psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
   -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
   -f "$SRCPATH/db/main_loop.sql"
+
+# Honour --start_block for the driver, which has no scheduler start-up step:
+# position the (detached, not yet started) context just before it.
+psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on -c "
+  DO \$\$
+  DECLARE __start_block INT;
+  BEGIN
+    SELECT start_block INTO __start_block FROM ${PROXY_WHITELIST_SCHEMA}.app_status;
+    IF hive.app_get_current_block_num('${PROXY_WHITELIST_SCHEMA}') < __start_block - 1
+       AND NOT hive.app_context_is_attached('${PROXY_WHITELIST_SCHEMA}') THEN
+      PERFORM hive.app_set_current_block_num('${PROXY_WHITELIST_SCHEMA}', __start_block - 1);
+    END IF;
+  END
+  \$\$;"
 
 # Install endpoint schema (PostgREST API)
 psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
