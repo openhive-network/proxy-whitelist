@@ -20,11 +20,21 @@ AS $BODY$
         r'<img\s[^>]*?src\s*=\s*["\']?(https?://[^\s"\'<>]+)',
         re.IGNORECASE
     )
+    # Markdown image: ![alt](url) or ![alt](url "title") or ![alt](<url>).
+    # Like <img>, the syntax itself declares an image, so no extension is
+    # required (IPFS gateways, CDN paths and proxied /p/ URLs have none).
+    MD_IMG_RE = re.compile(
+        r'!\[[^\]]*\]\(\s*<?(https?://[^\s\)\]"<>]+)',
+        re.IGNORECASE
+    )
 
     # Extract from body
     if body:
         # URLs in <img> tags are images by definition, regardless of extension
         for m in IMG_SRC_RE.finditer(body):
+            urls.add(m.group(1))
+        # Same for markdown image syntax
+        for m in MD_IMG_RE.finditer(body):
             urls.add(m.group(1))
         # Also scan for bare URLs with known image extensions (markdown, etc.)
         for m in IMAGE_RE.finditer(body):
