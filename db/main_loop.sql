@@ -226,6 +226,108 @@ BEGIN
 END;
 $$;
 
+-- Re-extract image URLs from every post created or edited in a block range.
+-- Use after an extraction change (e.g. adding markdown image support) so that
+-- posts processed by older code pick up the URLs it missed. Work is done in
+-- chunks of _chunk_size blocks, each committed separately, so it can run for
+-- hours and be interrupted/resumed by block number. Safe to run alongside live
+-- block processing: it only does ON CONFLICT DO NOTHING inserts and idempotent
+-- upserts. _to_block defaults to the app's current block.
+--
+--   CALL proxy_whitelist_app.backfill_posts(<first block>);
+--   CALL proxy_whitelist_app.backfill_posts_since('3 months');
+CREATE OR REPLACE PROCEDURE proxy_whitelist_app.backfill_posts(
+    IN _from_block INT,
+    IN _to_block INT DEFAULT NULL,
+    IN _chunk_size INT DEFAULT 10000
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    __from INT := _from_block;
+    __to INT;
+    __chunk_to INT;
+    __chunk_done INT;
+    __total INT := 0;
+    __attempt INT;
+    __started TIMESTAMPTZ := clock_timestamp();
+BEGIN
+    IF _chunk_size < 1 THEN
+        RAISE EXCEPTION 'backfill_posts: _chunk_size must be >= 1';
+    END IF;
+    __to := COALESCE(_to_block, hive.app_get_current_block_num('proxy_whitelist_app'));
+    IF __to IS NULL OR __to < __from THEN
+        RAISE NOTICE 'backfill_posts: nothing to do (from % to %)', __from, __to;
+        RETURN;
+    END IF;
+
+    RAISE NOTICE 'backfill_posts: blocks %-% in chunks of %', __from, __to, _chunk_size;
+
+    WHILE __from <= __to LOOP
+        __chunk_to := LEAST(__from + _chunk_size - 1, __to);
+        __attempt := 0;
+
+        -- Retry a chunk on transient failures (e.g. deadlock with the live
+        -- block processor). The failed subtransaction is rolled back by the
+        -- exception handler; COMMIT below only ever sees a clean chunk.
+        LOOP
+            BEGIN
+                __chunk_done := proxy_whitelist_app.block_range_data(__from, __chunk_to, false, 0);
+                EXIT;
+            EXCEPTION WHEN OTHERS THEN
+                __attempt := __attempt + 1;
+                IF __attempt >= 3 THEN
+                    RAISE;
+                END IF;
+                RAISE WARNING 'backfill_posts: blocks %-% failed (attempt %): %; retrying',
+                              __from, __chunk_to, __attempt, SQLERRM;
+                PERFORM pg_sleep(2);
+            END;
+        END LOOP;
+        COMMIT;
+
+        __total := __total + COALESCE(__chunk_done, 0);
+        RAISE NOTICE 'backfill_posts: blocks %-% done, % new URL associations (% total, % elapsed, % blocks/s)',
+                     __from, __chunk_to, COALESCE(__chunk_done, 0), __total,
+                     date_trunc('second', clock_timestamp() - __started),
+                     round((__chunk_to - _from_block + 1)
+                           / GREATEST(EXTRACT(EPOCH FROM clock_timestamp() - __started), 1));
+        __from := __chunk_to + 1;
+    END LOOP;
+
+    RAISE NOTICE 'backfill_posts: finished blocks %-%, % new URL associations in %',
+                 _from_block, __to, __total, date_trunc('second', clock_timestamp() - __started);
+END
+$$;
+
+-- Convenience wrapper: backfill posts from the first block at or after
+-- now() - _since up to the app's current block.
+CREATE OR REPLACE PROCEDURE proxy_whitelist_app.backfill_posts_since(
+    IN _since INTERVAL,
+    IN _chunk_size INT DEFAULT 10000
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    __from_block INT;
+BEGIN
+    -- ORDER BY created_at so the planner walks hive_blocks_created_at_idx
+    -- from the cutoff instead of scanning the primary key from block 1.
+    SELECT num INTO __from_block
+    FROM hafd.blocks
+    WHERE created_at >= now() - _since
+    ORDER BY created_at
+    LIMIT 1;
+
+    IF __from_block IS NULL THEN
+        RAISE NOTICE 'backfill_posts_since: no blocks newer than % ago', _since;
+        RETURN;
+    END IF;
+
+    CALL proxy_whitelist_app.backfill_posts(__from_block, NULL, _chunk_size);
+END
+$$;
+
 CREATE OR REPLACE PROCEDURE proxy_whitelist_app.massive_processing(
     IN _from INT, IN _to INT, IN _logs BOOLEAN, IN _worker INT, OUT _done INT
 )
