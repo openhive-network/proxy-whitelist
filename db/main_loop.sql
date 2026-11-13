@@ -655,9 +655,26 @@ $$;
 
 -- Register with the HAF application registry (driver entry point above) and
 -- declare the dependency on hivemind, which must already be registered (the
--- hivemind install runs first).
+-- hivemind install runs first). hivemind's registry name is looked up by its
+-- context: it registered as 'hivemind_app' before hivemind#445 and as
+-- 'hivemind' since, and a dependency on a name that is not registered fails.
 SELECT hive.app_register( 'proxy_whitelist_app', ARRAY[ 'proxy_whitelist_app' ]::hive.contexts_group, 'proxy_whitelist_app.process_blocks' );
-SELECT hive.app_add_dependency( 'proxy_whitelist_app', 'hivemind_app' );
+DO $$
+DECLARE
+  __hivemind TEXT[];
+BEGIN
+  SELECT array_agg(a.name ORDER BY a.name) INTO __hivemind
+    FROM hafd.applications a
+   WHERE a.contexts @> ARRAY['hivemind_app'];
+  IF __hivemind IS NULL THEN
+    RAISE EXCEPTION 'hivemind is not registered in the HAF application registry (no application holds context hivemind_app); proxy-whitelist needs hivemind installed and registered first';
+  ELSIF cardinality(__hivemind) > 1 THEN
+    RAISE EXCEPTION 'Cannot add proxy-whitelist''s dependency on hivemind: its context hivemind_app is registered by applications %', __hivemind;
+  ELSE
+    PERFORM hive.app_add_dependency( 'proxy_whitelist_app', __hivemind[1] );
+  END IF;
+END
+$$;
 
 
 -- Worker loop: claims tasks from block_tasks and processes them.
