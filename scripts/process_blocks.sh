@@ -71,6 +71,11 @@ echo "Starting proxy_whitelist..."
 # Record startup time for health checks
 date -uIseconds > /tmp/proxy_whitelist_startup_time.txt
 
+# A context moved back below the blocks the streams have served gets a new
+# stream source identity before processing resumes (check_stream_rewind).
+psql "$(postgres_access proxy_whitelist_startup)" -v ON_ERROR_STOP=on -Atc \
+  "SELECT ${PROXY_WHITELIST_SCHEMA}.check_stream_rewind(hive.app_get_current_block_num('${PROXY_WHITELIST_SCHEMA}'));"
+
 # The generic HAF block-processing driver (haf#341) runs the registered
 # ${PROXY_WHITELIST_SCHEMA}.process_blocks procedure per delivered range and
 # idles on its own connection between blocks; hive.app_next_iteration withholds

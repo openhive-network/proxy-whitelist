@@ -64,7 +64,7 @@ DO $__$
     },
     {
       "name": "Streams",
-      "description": "Block-ordered pages of the app's tables for replicas. Rows carry the block that introduced (urls, url authors) or last changed (profiles) them; rows older than the streams carry the sentinel block of /sync-status. A page covers [from_block, to_block] (to_block capped at the last processed block, returned in the Stream-To-Block header; the source identity is in Stream-Sync-Uuid) ordered by (block, natural key); its size is the limit query parameter, at most 100000. A page shorter than limit completes the range; otherwise request the next one with from_block set to the last row's block and after_* set to its key."
+      "description": "Block-ordered pages of the app's tables for replicas (contract version 2, stream_schema_version of /sync-status). Rows carry the block that introduced (accounts, urls, url authors) or last changed (profiles) them; rows older than the streams carry the sentinel block of /sync-status. A page covers [from_block, to_block] (to_block capped at the last processed block) ordered by (block, natural key) and holds at most page_size rows (default 1000, at most 100000); do not use PostgREST's limit parameter. A page shorter than page_size completes the range and its Stream-To-Block header is the applied upper bound; a full page's Stream-To-Block is its last row's block. Continue with from_block set to Stream-To-Block and after_* set to the last row's key (or from Stream-To-Block + 1 without after_* after a short page). The source identity is in the Stream-Sync-Uuid header; re-bootstrap when it changes."
     },
     {
       "name": "Other",
@@ -243,40 +243,60 @@ DO $__$
         "tags": [
           "Streams"
         ],
-        "summary": "Page of accounts in id order",
-        "description": "Accounts are append-only and hive_id is deterministic, so a replica keys them on hive_id; id is only the paging cursor.",
+        "summary": "Page of accounts ordered by (first_block, name)",
+        "description": "Accounts with the block that introduced them to this app. Accounts are append-only and hive_id is deterministic, so a replica keys them on hive_id.",
         "operationId": "proxy_whitelist_endpoints.stream_accounts",
         "parameters": [
           {
-            "name": "after_id",
+            "name": "from_block",
             "in": "query",
             "required": false,
             "schema": {
               "type": "integer",
               "default": 0
             },
-            "description": "return accounts with a greater id"
+            "description": "first block of the range, and the block of the after_name cursor"
           },
           {
-            "name": "limit",
+            "name": "to_block",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "last block of the range; defaults to, and is capped at, the last processed block"
+          },
+          {
+            "name": "after_name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "resume after this account name (bytewise order) within from_block"
+          },
+          {
+            "name": "page_size",
             "in": "query",
             "required": false,
             "schema": {
               "type": "integer",
+              "default": 1000,
+              "minimum": 1,
               "maximum": 100000
             },
-            "description": "page size (PostgREST's row limit); at most 100000 rows are returned"
+            "description": "rows to return; a larger value is capped at 100000. A page shorter than this completes the range"
           }
         ],
         "responses": {
           "200": {
-            "description": "Accounts ordered by id",
+            "description": "Accounts with the block that introduced them",
             "headers": {
               "Stream-To-Block": {
                 "schema": {
                   "type": "integer"
                 },
-                "description": "the upper block the page was read with"
+                "description": "the applied upper block when the page is shorter than page_size, else the last row's block: continue from it with after_* set to the last row's key"
               },
               "Stream-Sync-Uuid": {
                 "schema": {
@@ -293,7 +313,7 @@ DO $__$
                   "items": {
                     "type": "object",
                     "properties": {
-                      "id": {
+                      "first_block": {
                         "type": "integer"
                       },
                       "hive_id": {
@@ -309,7 +329,7 @@ DO $__$
             }
           },
           "400": {
-            "description": "from_block is negative or to_block is lower than from_block"
+            "description": "from_block is negative, to_block is lower than from_block or page_size is below 1"
           }
         }
       }
@@ -351,14 +371,16 @@ DO $__$
             "description": "resume after this md5 (lowercase hex) within from_block"
           },
           {
-            "name": "limit",
+            "name": "page_size",
             "in": "query",
             "required": false,
             "schema": {
               "type": "integer",
+              "default": 1000,
+              "minimum": 1,
               "maximum": 100000
             },
-            "description": "page size (PostgREST's row limit); at most 100000 rows are returned"
+            "description": "rows to return; a larger value is capped at 100000. A page shorter than this completes the range"
           }
         ],
         "responses": {
@@ -369,7 +391,7 @@ DO $__$
                 "schema": {
                   "type": "integer"
                 },
-                "description": "the upper block the page was read with"
+                "description": "the applied upper block when the page is shorter than page_size, else the last row's block: continue from it with after_* set to the last row's key"
               },
               "Stream-Sync-Uuid": {
                 "schema": {
@@ -402,7 +424,7 @@ DO $__$
             }
           },
           "400": {
-            "description": "from_block is negative or to_block is lower than from_block"
+            "description": "from_block is negative, to_block is lower than from_block or page_size is below 1"
           }
         }
       }
@@ -450,17 +472,19 @@ DO $__$
             "schema": {
               "type": "string"
             },
-            "description": "with after_md5: resume after this account within that URL; without it the whole URL is skipped"
+            "description": "resume after this account within the after_md5 URL; given together with after_md5"
           },
           {
-            "name": "limit",
+            "name": "page_size",
             "in": "query",
             "required": false,
             "schema": {
               "type": "integer",
+              "default": 1000,
+              "minimum": 1,
               "maximum": 100000
             },
-            "description": "page size (PostgREST's row limit); at most 100000 rows are returned"
+            "description": "rows to return; a larger value is capped at 100000. A page shorter than this completes the range"
           }
         ],
         "responses": {
@@ -471,7 +495,7 @@ DO $__$
                 "schema": {
                   "type": "integer"
                 },
-                "description": "the upper block the page was read with"
+                "description": "the applied upper block when the page is shorter than page_size, else the last row's block: continue from it with after_* set to the last row's key"
               },
               "Stream-Sync-Uuid": {
                 "schema": {
@@ -504,7 +528,7 @@ DO $__$
             }
           },
           "400": {
-            "description": "from_block is negative or to_block is lower than from_block"
+            "description": "from_block is negative, to_block is lower than from_block, page_size is below 1 or only one of after_md5 and after_account is given"
           }
         }
       }
@@ -547,14 +571,16 @@ DO $__$
             "description": "resume after this account within from_block"
           },
           {
-            "name": "limit",
+            "name": "page_size",
             "in": "query",
             "required": false,
             "schema": {
               "type": "integer",
+              "default": 1000,
+              "minimum": 1,
               "maximum": 100000
             },
-            "description": "page size (PostgREST's row limit); at most 100000 rows are returned"
+            "description": "rows to return; a larger value is capped at 100000. A page shorter than this completes the range"
           }
         ],
         "responses": {
@@ -565,7 +591,7 @@ DO $__$
                 "schema": {
                   "type": "integer"
                 },
-                "description": "the upper block the page was read with"
+                "description": "the applied upper block when the page is shorter than page_size, else the last row's block: continue from it with after_* set to the last row's key"
               },
               "Stream-Sync-Uuid": {
                 "schema": {
@@ -607,7 +633,7 @@ DO $__$
             }
           },
           "400": {
-            "description": "from_block is negative or to_block is lower than from_block"
+            "description": "from_block is negative, to_block is lower than from_block or page_size is below 1"
           }
         }
       }
@@ -768,11 +794,11 @@ DO $__$
                     "sync_uuid": {
                       "type": "string",
                       "format": "uuid",
-                      "description": "identity of this source database, minted on the first install and kept by reinstalls; a replica re-bootstraps when it changes"
+                      "description": "identity of this source database, minted on the first install and kept by reinstalls, re-minted when the app's block is moved back below blocks the streams have served; a replica re-bootstraps when it changes"
                     },
                     "stream_schema_version": {
                       "type": "integer",
-                      "description": "version of the /stream/* contract"
+                      "description": "version of the /stream/* contract (2: page_size and the end-of-page Stream-To-Block, block-paged accounts)"
                     },
                     "stream_sentinel_block": {
                       "type": "integer",
@@ -784,7 +810,7 @@ DO $__$
                   "last_block_num": 5000000,
                   "last_block_time": "2016-09-15T19:47:21",
                   "sync_uuid": "0b5f8f0e-6c3e-4a51-9a49-3f2f0c1d7e21",
-                  "stream_schema_version": 1,
+                  "stream_schema_version": 2,
                   "stream_sentinel_block": 4999000
                 }
               }

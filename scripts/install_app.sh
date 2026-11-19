@@ -153,6 +153,12 @@ psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on -c "
   END
   \$\$;"
 
+# A new stream source identity when the context is behind the blocks the
+# streams have served (e.g. a HAF replay that kept this schema); records the
+# stream head on the first install that has it.
+psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
+  -c "SET ROLE proxy_whitelist_owner; SELECT ${PROXY_WHITELIST_SCHEMA}.check_stream_rewind(hive.app_get_current_block_num('${PROXY_WHITELIST_SCHEMA}'));"
+
 # One-time fill of account_profiles from hivemind's accounts (a no-op once done)
 psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
   -c "SET ROLE proxy_whitelist_owner; SELECT ${PROXY_WHITELIST_SCHEMA}.backfill_account_profiles();"
