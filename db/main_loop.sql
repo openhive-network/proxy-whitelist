@@ -432,6 +432,27 @@ BEGIN
 END
 $$;
 
+-- Whether the scheduler should log 'Waiting for hivemind to reach block ...'
+-- on this poll: on entering the wait (nothing logged yet), when the awaited
+-- block differs from the one last logged, or as a heartbeat once 10 s have
+-- passed since the last such line.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.should_log_hivemind_wait(
+    _awaited_block INT,
+    _last_logged_block INT,
+    _last_logged_at TIMESTAMPTZ,
+    _now TIMESTAMPTZ
+)
+RETURNS BOOLEAN
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    SELECT _last_logged_block IS NULL
+        OR _last_logged_at IS NULL
+        OR _awaited_block IS DISTINCT FROM _last_logged_block
+        OR _now - _last_logged_at >= INTERVAL '10 seconds';
+$$;
+
 -- Advisory lock helper with timeout (same as hivesense).
 CREATE OR REPLACE PROCEDURE proxy_whitelist_app.wait_for_advisory_lock(
     _namespace INT, _worker INT, _timeout_ms INT DEFAULT 5000
@@ -483,6 +504,8 @@ DECLARE
     __done                          INT;
     __hivemind_wait_start           TIMESTAMPTZ;
     __hivemind_wait_timeout CONSTANT INTERVAL := '300 seconds';
+    __wait_logged_block             INT;
+    __wait_logged_at                TIMESTAMPTZ;
 BEGIN
     -- Block until any active hivemind/proxy-whitelist installer releases its
     -- exclusive lock; held by this session until the scheduler returns.
@@ -568,9 +591,15 @@ BEGIN
                 CONTINUE main_loop;
             END IF;
 
-            RAISE NOTICE 'Waiting for hivemind to reach block % (at %)',
-                         __planned_range.last_block,
-                         __hivemind_current_block;
+            IF proxy_whitelist_app.should_log_hivemind_wait(
+                __planned_range.last_block, __wait_logged_block, __wait_logged_at, clock_timestamp()
+            ) THEN
+                RAISE NOTICE 'Waiting for hivemind to reach block % (at %)',
+                             __planned_range.last_block,
+                             __hivemind_current_block;
+                __wait_logged_block := __planned_range.last_block;
+                __wait_logged_at := clock_timestamp();
+            END IF;
             PERFORM pg_sleep(1);
 
             __breaking_reason := proxy_whitelist_app.isBreakingPending(
