@@ -324,9 +324,10 @@ class PostgrestDidNotStart(Exception):
 
 
 @contextlib.contextmanager
-def postgrest(db_uri: str, log_path: str) -> Iterator[str]:
+def postgrest(db_uri: str, log_path: str, admin_port: int | None = None) -> Iterator[str]:
     """PostgREST serving db_uri the way haf_api_node's proxy-whitelist-postgrest does, on a
-    free loopback port; yields its base URL. Raises PostgrestDidNotStart (see log_path)."""
+    free loopback port (its admin server, when asked, on admin_port); yields its base URL.
+    Raises PostgrestDidNotStart (see log_path)."""
     port = free_port()
     base = f"http://127.0.0.1:{port}"
     env = dict(os.environ,
@@ -337,6 +338,8 @@ def postgrest(db_uri: str, log_path: str) -> Iterator[str]:
                PGRST_DB_EXTRA_SEARCH_PATH="proxy_whitelist_app",
                PGRST_SERVER_HOST="127.0.0.1",
                PGRST_SERVER_PORT=str(port))
+    if admin_port is not None:
+        env["PGRST_ADMIN_SERVER_PORT"] = str(admin_port)
     with open(log_path, "w", encoding="utf-8") as log:
         proc = subprocess.Popen(["postgrest"], env=env, stdout=log, stderr=subprocess.STDOUT)
         try:

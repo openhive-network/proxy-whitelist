@@ -8,7 +8,9 @@ SET ROLE proxy_whitelist_owner;
  * when the source stalls or is unreachable, the syncer dies or the source
  * identity no longer matches: a health check that judges the primary by the
  * age of last_block_time judges a replica the same way. Both are null until
- * the first full catch-up (bootstrap_complete).
+ * the first full catch-up (bootstrap_complete). sync_uuid is the replica's own
+ * identity (re-minted when it truncates and bootstraps again), not the
+ * source's: the replica serves no streams under the source's identity.
  */
 CREATE OR REPLACE FUNCTION proxy_whitelist_replica.sync_status()
 RETURNS JSON
@@ -22,7 +24,7 @@ BEGIN
     SELECT json_build_object(
       'last_block_num', s.source_block_num,
       'last_block_time', to_char(s.source_block_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS'),
-      'sync_uuid', s.source_sync_uuid,
+      'sync_uuid', s.replica_sync_uuid,
       'stream_schema_version', s.stream_schema_version,
       'stream_sentinel_block', s.stream_sentinel_block,
       'source_sync_uuid', s.source_sync_uuid,

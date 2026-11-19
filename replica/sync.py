@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Follow a proxy-whitelist primary's replication streams into a replica database.
 
-    sync.py [--once] [--reset]
+    sync.py [--once] [--reset] [--rebuild]
 
 Configuration (environment):
-  PROXY_WHITELIST_SOURCE_URL     the primary's API base, e.g. http://10.10.10.8/proxy-whitelist-api
-  POSTGRES_URL                   the replica database (installed by replica/install.sh), as
-                                 its owner or a superuser
-  POLL_INTERVAL_S                seconds between cycles (default 5)
-  PAGE_LIMIT                     page_size of every stream request (default and maximum 100000)
-  PROXY_WHITELIST_REPLICA_RESET  1 to act as --reset
+  PROXY_WHITELIST_SOURCE_URL       the primary's API base, e.g. http://10.10.10.8/proxy-whitelist-api
+  POSTGRES_URL                     the replica database (installed by replica/install.sh), as
+                                   its owner or a superuser
+  POLL_INTERVAL_S                  seconds between cycles (default 5)
+  PAGE_LIMIT                       page_size of every stream request (default and maximum 100000)
+  PROXY_WHITELIST_REPLICA_RESET    1 to act as --reset
+  PROXY_WHITELIST_REPLICA_REBUILD  1 to act as --rebuild once: the replica records that it
+                                   rebuilt for it and ignores it on later starts until it has
+                                   been seen unset
 
 One cycle reads the source's /sync-status, checks the source identity
 (sync_uuid, stream_schema_version) against the one stored on first contact,
@@ -19,11 +22,15 @@ block as fully replicated. Each page is applied together with its cursor in
 one transaction, so a failure never loses or skips a page: the next cycle
 resumes from the last applied one.
 
-A changed source identity sets sync_error and stops the syncer (exit 2) while
-the replica keeps serving its data; with --reset the replicated tables and
-cursors are truncated instead and the bootstrap starts again. Other failures
-set sync_error and are retried with a backoff of 3 s doubling to 60 s
-(--once: exit 1).
+A changed source identity sets sync_error and writes nothing more while the
+replica keeps serving its data: the syncer checks the source again every
+POLL_INTERVAL_S and resumes once the identity matches (--once: exit 2). With
+--reset the replicated tables and cursors are truncated instead and the
+bootstrap starts again; --rebuild does that before the first cycle whether or
+not the identity changed. A page the source path gives up on (HTTP 502/504, a
+timeout) is retried at once with half the stream's page size, down to
+MIN_PAGE_SIZE. Other failures set sync_error and are retried with a backoff of
+3 s doubling to 60 s (--once: exit 1).
 """
 import argparse
 import csv
@@ -48,6 +55,10 @@ STREAM_SCHEMA_VERSION = 2
 # The source's stream_page_cap(): a larger page_size would be served capped,
 # and a capped page would read as a short (range-completing) one.
 MAX_PAGE_SIZE = 100000
+# The smallest page a slow source path is retried with (or PAGE_LIMIT when lower).
+MIN_PAGE_SIZE = 1000
+# url fields are unbounded TEXT on the primary; csv's default limit is 128 KiB.
+CSV_FIELD_SIZE_LIMIT = 1 << 20
 RETRY_SLEEP_S = 3
 MAX_BACKOFF_S = 60
 HTTP_TIMEOUT_S = 300
@@ -62,6 +73,10 @@ class SyncError(Exception):
 
 class IdentityMismatch(SyncError):
     """The source is not the one the replica bootstrapped from (or speaks another contract)."""
+
+
+class SourceTimeout(SyncError):
+    """The source, or a proxy in front of it, gave up on a request (HTTP 502/504 or a timeout)."""
 
 
 @dataclass(frozen=True)
@@ -123,6 +138,7 @@ class State:
     stream_schema_version: int | None
     cursors: dict[str, Cursor]
     bootstrap_complete: bool
+    rebuild_env_honoured: bool = False
 
 
 class Source(Protocol):
@@ -135,7 +151,8 @@ class Source(Protocol):
 class Store(Protocol):
     def load(self) -> State: ...
     def adopt_source(self, source_url: str, status: SourceStatus) -> None: ...
-    def reset(self, source_url: str, status: SourceStatus) -> None: ...
+    def reset(self, source_url: str, status: SourceStatus, rebuild_env_honoured: bool) -> None: ...
+    def set_rebuild_env_honoured(self, honoured: bool) -> None: ...
     def apply_page(self, stream: Stream, rows: list[dict[str, Any]], cursor: Cursor) -> None: ...
     def replace_blacklists(self, urls: list[str], accounts: list[str]) -> None: ...
     def finish_cycle(self, source_url: str, status: SourceStatus) -> None: ...
@@ -161,6 +178,7 @@ class HttpSource:
         self._base = base_url.rstrip("/")
         self._timeout = timeout
         self._csv = True
+        csv.field_size_limit(CSV_FIELD_SIZE_LIMIT)
 
     def _get(self, path: str, accept: str) -> tuple[bytes, dict[str, str]]:
         req = urllib.request.Request(self._base + path, headers={"Accept": accept})
@@ -169,8 +187,17 @@ class HttpSource:
                 return resp.read(), {k.lower(): v for k, v in resp.headers.items()}
         except urllib.error.HTTPError as err:
             body = err.read()[:500].decode(errors="replace")
-            raise _HttpStatus(err.code, f"GET {path}: HTTP {err.code}: {body}") from err
-        except (urllib.error.URLError, OSError) as err:
+            message = f"GET {path}: HTTP {err.code}: {body}"
+            if err.code in (502, 504):
+                raise SourceTimeout(message) from err
+            raise _HttpStatus(err.code, message) from err
+        except TimeoutError as err:
+            raise SourceTimeout(f"GET {path}: no answer within {self._timeout} s") from err
+        except urllib.error.URLError as err:
+            if isinstance(err.reason, TimeoutError):
+                raise SourceTimeout(f"GET {path}: no answer within {self._timeout} s") from err
+            raise SyncError(f"GET {path}: {err}") from err
+        except OSError as err:
             raise SyncError(f"GET {path}: {err}") from err
 
     def _get_json(self, path: str) -> Any:
@@ -218,7 +245,7 @@ class HttpSource:
                 for field in stream.int_fields:
                     row[field] = int(row[field])
             to_block = int(headers["stream-to-block"])
-        except (ValueError, KeyError, TypeError) as err:
+        except (ValueError, KeyError, TypeError, csv.Error) as err:
             raise SyncError(f"GET {path}: undecodable page: {type(err).__name__}: {err}") from err
         return Page(rows, to_block, headers.get("stream-sync-uuid"))
 
@@ -231,9 +258,14 @@ class HttpSource:
 
 
 class Syncer:
-    """One sync cycle at a time, from a source into a store."""
+    """One sync cycle at a time, from a source into a store.
 
-    def __init__(self, source: Source, store: Store, source_url: str, page_size: int, reset: bool) -> None:
+    rebuild truncates the replica before the first cycle; rebuild_from_env does
+    the same unless the store records that it already did so for the environment
+    variable, and when the variable is unset the record is cleared."""
+
+    def __init__(self, source: Source, store: Store, source_url: str, page_size: int, reset: bool,
+                 rebuild: bool = False, rebuild_from_env: bool = False) -> None:
         if not 1 <= page_size <= MAX_PAGE_SIZE:
             raise ValueError(f"page size must be within [1, {MAX_PAGE_SIZE}], got {page_size}")
         self.source = source
@@ -241,6 +273,10 @@ class Syncer:
         self.source_url = source_url
         self.page_size = page_size
         self.reset = reset
+        self._rebuild = rebuild
+        self._rebuild_from_env = rebuild_from_env
+        self._rebuild_checked = False
+        self._page_sizes = {stream.name: page_size for stream in STREAMS}
 
     def cycle(self) -> SourceStatus:
         """Replicates the source up to its current last_block_num; returns the status it reached."""
@@ -261,6 +297,8 @@ class Syncer:
                 f"the source serves stream_schema_version {status.stream_schema_version}, "
                 f"this syncer reads {STREAM_SCHEMA_VERSION}")
         state = self.store.load()
+        if not self._rebuild_checked:
+            state = self._rebuilt(state, status)
         if state.sync_uuid is None:
             log.info("first contact with %s: sync_uuid %s", self.source_url, status.sync_uuid)
             self.store.adopt_source(self.source_url, status)
@@ -271,8 +309,24 @@ class Syncer:
             if not self.reset:
                 raise IdentityMismatch(mismatch)
             log.warning("%s; resetting the replica and bootstrapping again", mismatch)
-            self.store.reset(self.source_url, status)
+            self.store.reset(self.source_url, status, state.rebuild_env_honoured)
             return self.store.load()
+        return state
+
+    def _rebuilt(self, state: State, status: SourceStatus) -> State:
+        """Truncates the replica when a rebuild is requested and not yet honoured; returns the state to sync from."""
+        env_pending = self._rebuild_from_env and not state.rebuild_env_honoured
+        if self._rebuild or env_pending:
+            via = "--rebuild" if self._rebuild else "PROXY_WHITELIST_REPLICA_REBUILD=1"
+            log.warning("%s: truncating the replica and bootstrapping again from %s", via, self.source_url)
+            self.store.reset(self.source_url, status, self._rebuild_from_env)
+            state = self.store.load()
+        elif state.rebuild_env_honoured and not self._rebuild_from_env:
+            self.store.set_rebuild_env_honoured(False)
+        elif self._rebuild_from_env:
+            log.info("PROXY_WHITELIST_REPLICA_REBUILD=1 was honoured by an earlier start; "
+                     "unset it to allow another rebuild")
+        self._rebuild_checked = True
         return state
 
     def _follow(self, stream: Stream, cursor: Cursor, status: SourceStatus) -> None:
@@ -290,18 +344,32 @@ class Syncer:
                 cursor = self._apply_next(stream, from_block, after, target, status.sync_uuid)
             except IdentityMismatch:
                 raise
+            except SourceTimeout as err:
+                if not self._smaller_page(stream, err):
+                    raise SyncError(f"{stream.name} at cursor {cursor}: {err}") from err
             except SyncError as err:
                 raise SyncError(f"{stream.name} at cursor {cursor}: {err}") from err
 
+    def _smaller_page(self, stream: Stream, err: SourceTimeout) -> bool:
+        """Halves the stream's page size after a page the source path gave up on; False at the floor."""
+        size = self._page_sizes[stream.name]
+        smaller = max(size // 2, min(MIN_PAGE_SIZE, self.page_size))
+        if smaller == size:
+            return False
+        log.warning("%s: %s; retrying with page_size %d instead of %d", stream.name, err, smaller, size)
+        self._page_sizes[stream.name] = smaller
+        return True
+
     def _apply_next(self, stream: Stream, from_block: int, after: dict[str, str],
                     target: int, sync_uuid: str) -> Cursor:
-        page = self.source.page(stream, from_block, target, after, self.page_size)
+        page_size = self._page_sizes[stream.name]
+        page = self.source.page(stream, from_block, target, after, page_size)
         if page.sync_uuid != sync_uuid:
             raise IdentityMismatch(f"{stream.name}: page from Stream-Sync-Uuid {page.sync_uuid}, expected {sync_uuid}")
         rows = page.rows
-        if len(rows) > self.page_size:
-            raise SyncError(f"page of {len(rows)} rows for page_size {self.page_size}")
-        if len(rows) == self.page_size:
+        if len(rows) > page_size:
+            raise SyncError(f"page of {len(rows)} rows for page_size {page_size}")
+        if len(rows) == page_size:
             last = rows[-1]
             if page.to_block != last[stream.block_field]:
                 raise SyncError(f"full page ends at block {last[stream.block_field]}, Stream-To-Block {page.to_block}")
@@ -312,6 +380,9 @@ class Syncer:
             cursor = Cursor(page.to_block)
         self.store.apply_page(stream, rows, cursor)
         log.debug("%s: %d rows, cursor %s", stream.name, len(rows), cursor)
+        if page_size != self.page_size:
+            log.info("%s: page_size %d passed; back to %d", stream.name, page_size, self.page_size)
+            self._page_sizes[stream.name] = self.page_size
         return cursor
 
 
@@ -352,7 +423,7 @@ class PgStore:
     def load(self) -> State:
         def work(cur: psycopg.Cursor) -> State:
             cur.execute("""
-                SELECT source_sync_uuid::TEXT, stream_schema_version, bootstrap_complete,
+                SELECT source_sync_uuid::TEXT, stream_schema_version, bootstrap_complete, rebuild_env_honoured,
                        accounts_block, accounts_after_name,
                        urls_block, urls_after_md5,
                        url_authors_block, url_authors_after_md5, url_authors_after_account,
@@ -361,13 +432,13 @@ class PgStore:
             row = cur.fetchone()
             if row is None:
                 raise SyncError("proxy_whitelist_replica.state has no row: run replica/install.sh")
-            values = list(row[3:])
+            values = list(row[4:])
             cursors = {}
             for stream in STREAMS:
                 block, values = values[0], values[1:]
                 key, values = tuple(values[:len(stream.key_fields)]), values[len(stream.key_fields):]
                 cursors[stream.name] = Cursor(block, None if key[0] is None else key)
-            return State(row[0], row[1], cursors, row[2])
+            return State(row[0], row[1], cursors, row[2], row[3])
         return self._transaction(work)
 
     @staticmethod
@@ -380,14 +451,20 @@ class PgStore:
     def adopt_source(self, source_url: str, status: SourceStatus) -> None:
         self._transaction(lambda cur: self._set_identity(cur, source_url, status))
 
-    def reset(self, source_url: str, status: SourceStatus) -> None:
+    def reset(self, source_url: str, status: SourceStatus, rebuild_env_honoured: bool) -> None:
         def work(cur: psycopg.Cursor) -> None:
             cur.execute(sql.SQL("TRUNCATE {} RESTART IDENTITY").format(
                 sql.SQL(", ").join(sql.SQL(t) for t in self._REPLICATED_TABLES)))
+            # A new state row: fresh cursors, bootstrap_complete false and a newly minted replica_sync_uuid.
             cur.execute("DELETE FROM proxy_whitelist_replica.state")
-            cur.execute("INSERT INTO proxy_whitelist_replica.state (id) VALUES (TRUE)")
+            cur.execute("INSERT INTO proxy_whitelist_replica.state (id, rebuild_env_honoured) VALUES (TRUE, %s)",
+                        (rebuild_env_honoured,))
             self._set_identity(cur, source_url, status)
         self._transaction(work)
+
+    def set_rebuild_env_honoured(self, honoured: bool) -> None:
+        self._transaction(lambda cur: cur.execute(
+            "UPDATE proxy_whitelist_replica.state SET rebuild_env_honoured = %s", (honoured,)))
 
     def apply_page(self, stream: Stream, rows: list[dict[str, Any]], cursor: Cursor) -> None:
         columns = [f"{stream.name}_block"] + [f"{stream.name}_{p}" for p in stream.after_params]
@@ -512,26 +589,42 @@ class PgStore:
 def run(syncer: Syncer, poll_interval_s: float, once: bool,
         sleep: Callable[[float], None] = time.sleep) -> int:
     """Cycles until stopped: 0 after one successful --once cycle, 1 after a failed --once
-    cycle, 2 on a source identity mismatch without --reset."""
+    cycle, 2 after a --once cycle refused for a source identity mismatch without --reset.
+    Without --once such a mismatch is checked again every poll_interval_s."""
     backoff = RETRY_SLEEP_S
+    mismatch: str | None = None
     while True:
         try:
             status = syncer.cycle()
             log.debug("replicated up to block %s", status.block_num)
+            if mismatch is not None:
+                log.info("the source identity matches again; syncing resumed")
+                mismatch = None
             backoff = RETRY_SLEEP_S
             if once:
                 return 0
             sleep(poll_interval_s)
             continue
         except IdentityMismatch as err:
-            _record_error(syncer.store, err)
             if not syncer.reset:
-                log.error("%s; refusing to continue (the replica keeps serving its data; run with --reset to bootstrap again)", err)
-                return 2
+                if once:
+                    _record_error(syncer.store, err)
+                    log.error("%s; refusing to continue (the replica keeps serving its data; "
+                              "run with --reset to bootstrap again)", err)
+                    return 2
+                if str(err) != mismatch:
+                    _record_error(syncer.store, err)
+                    log.error("%s; writing nothing until it matches again, checking every %s s (the replica "
+                              "keeps serving its data; run with --reset to bootstrap again)", err, poll_interval_s)
+                    mismatch = str(err)
+                sleep(poll_interval_s)
+                continue
+            _record_error(syncer.store, err)
             log.warning("%s", err)
         except SyncError as err:
             log.warning("%s", err)
             _record_error(syncer.store, err)
+            mismatch = None
         if once:
             return 1
         log.info("retrying in %s s", backoff)
@@ -550,7 +643,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--once", action="store_true", help="run one cycle and exit (1 when it fails)")
     parser.add_argument("--reset", action="store_true",
-                        help="on a source identity change, truncate the replica and bootstrap again instead of exiting")
+                        help="on a source identity change, truncate the replica and bootstrap again instead of waiting")
+    parser.add_argument("--rebuild", action="store_true",
+                        help="truncate the replica and bootstrap again before the first cycle, whatever the source identity")
     args = parser.parse_args(argv)
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(),
                         format="%(asctime)s  %(levelname)s  %(message)s")
@@ -560,7 +655,9 @@ def main(argv: list[str] | None = None) -> int:
         poll_interval_s = float(os.environ.get("POLL_INTERVAL_S", "5"))
         page_limit = int(os.environ.get("PAGE_LIMIT", str(MAX_PAGE_SIZE)))
         syncer = Syncer(HttpSource(source_url), PgStore(postgres_url), source_url, page_limit,
-                        reset=args.reset or os.environ.get("PROXY_WHITELIST_REPLICA_RESET") == "1")
+                        reset=args.reset or os.environ.get("PROXY_WHITELIST_REPLICA_RESET") == "1",
+                        rebuild=args.rebuild,
+                        rebuild_from_env=os.environ.get("PROXY_WHITELIST_REPLICA_REBUILD") == "1")
     except KeyError as err:
         log.critical("missing environment variable %s", err)
         return 1

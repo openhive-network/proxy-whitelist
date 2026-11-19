@@ -1,10 +1,19 @@
 """replica/sync.py's paging, cursors and source identity handling against an
-in-memory source that serves stream contract v2 and an in-memory store. No
+in-memory source that serves stream contract v2 and an in-memory store, and
+its HTTP client against that source answering in place of urllib. No
 database, no network."""
+import csv
+import email.message
 import hashlib
 import importlib.util
+import io
+import json
+import logging
 import pathlib
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
@@ -82,7 +91,9 @@ class FakeStore:
     def __init__(self) -> None:
         self._fresh()
         self.error: str | None = None
+        self.errors_set = 0
         self.fail_on: str | None = None
+        self.rebuild_env_honoured = False
 
     def _fresh(self) -> None:
         self.uuid: str | None = None
@@ -100,16 +111,21 @@ class FakeStore:
         self.resets = 0
 
     def load(self) -> Any:
-        return sync.State(self.uuid, self.version, dict(self.cursors), self.bootstrap_complete)
+        return sync.State(self.uuid, self.version, dict(self.cursors), self.bootstrap_complete,
+                          self.rebuild_env_honoured)
 
     def adopt_source(self, source_url: str, status: Any) -> None:
         self.uuid, self.version = status.sync_uuid, status.stream_schema_version
 
-    def reset(self, source_url: str, status: Any) -> None:
+    def reset(self, source_url: str, status: Any, rebuild_env_honoured: bool) -> None:
         resets = self.resets
         self._fresh()
         self.resets = resets + 1
+        self.rebuild_env_honoured = rebuild_env_honoured
         self.adopt_source(source_url, status)
+
+    def set_rebuild_env_honoured(self, honoured: bool) -> None:
+        self.rebuild_env_honoured = honoured
 
     def apply_page(self, stream: Any, rows: list[dict[str, Any]], cursor: Any) -> None:
         if self.fail_on == stream.name:
@@ -139,10 +155,83 @@ class FakeStore:
 
     def set_error(self, message: str) -> None:
         self.error = message
+        self.errors_set += 1
 
 
-def syncer(source: FakeSource, store: FakeStore, page_size: int = 100, reset: bool = False) -> Any:
-    return sync.Syncer(source, store, "http://primary.invalid/proxy-whitelist-api", page_size, reset)
+SOURCE_URL = "http://primary.invalid/proxy-whitelist-api"
+CSV_FIELDS = {"accounts": ["first_block", "hive_id", "name"], "urls": ["first_block", "md5", "url"],
+              "url_authors": ["first_block", "url_md5", "account_name"]}
+
+
+class HttpFixture:
+    """A FakeSource behind the primary's URL rewriter, answering HttpSource's urllib requests.
+
+    failures[stream] are raised, one per request, before that stream's next pages are
+    served; bodies[stream] replaces the body of its pages."""
+
+    def __init__(self, source: FakeSource) -> None:
+        self.source = source
+        self.failures: dict[str, list[Exception]] = {}
+        self.bodies: dict[str, bytes] = {}
+        self.page_requests: list[tuple[str, int, dict[str, str], int, str]] = []
+
+    def urlopen(self, req: urllib.request.Request, timeout: float) -> "Response":
+        url = urllib.parse.urlsplit(req.full_url)
+        path = url.path.removeprefix(urllib.parse.urlsplit(SOURCE_URL).path)
+        query = dict(urllib.parse.parse_qsl(url.query))
+        if path == "/sync-status":
+            status = self.source.status()
+            return self._answer(json.dumps({
+                "last_block_num": status.block_num, "last_block_time": status.block_time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "sync_uuid": status.sync_uuid, "stream_schema_version": status.stream_schema_version,
+                "stream_sentinel_block": status.stream_sentinel_block}).encode(), "application/json")
+        if path == "/stream/blacklists":
+            urls, accounts = self.source.blacklists()
+            return self._answer(json.dumps({"urls": urls, "accounts": accounts}).encode(), "application/json")
+        stream = next(s for s in sync.STREAMS if s.path == path)
+        after = {p: query[p] for p in stream.after_params if p in query}
+        failures = self.failures.get(stream.name, [])
+        outcome = type(failures[0]).__name__ if failures else "ok"
+        self.page_requests.append((stream.name, int(query["from_block"]), after, int(query["page_size"]), outcome))
+        if failures:
+            raise failures.pop(0)
+        page = self.source.page(stream, int(query["from_block"]), int(query["to_block"]), after, int(query["page_size"]))
+        headers = {"Stream-To-Block": str(page.to_block), "Stream-Sync-Uuid": page.sync_uuid}
+        if stream.name in self.bodies:
+            return self._answer(self.bodies[stream.name], "text/csv", headers)
+        if stream.csv and req.get_header("Accept") == "text/csv":
+            out = io.StringIO()
+            writer = csv.DictWriter(out, CSV_FIELDS[stream.name])
+            writer.writeheader()
+            writer.writerows(page.rows)
+            return self._answer(out.getvalue().encode(), "text/csv", headers)
+        return self._answer(json.dumps(page.rows).encode(), "application/json", headers)
+
+    @staticmethod
+    def _answer(body: bytes, content_type: str, headers: dict[str, str] | None = None) -> "Response":
+        return Response(body, {"Content-Type": content_type, **(headers or {})})
+
+
+class Response(io.BytesIO):
+    def __init__(self, body: bytes, headers: dict[str, str]) -> None:
+        super().__init__(body)
+        self.headers = headers
+
+
+def http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(SOURCE_URL, code, "Gateway Time-out", email.message.Message(),
+                                  io.BytesIO(b"<html><body><h1>504 Gateway Time-out</h1></body></html>"))
+
+
+@pytest.fixture
+def http(monkeypatch: pytest.MonkeyPatch) -> HttpFixture:
+    fixture = HttpFixture(seeded_source())
+    monkeypatch.setattr(sync.urllib.request, "urlopen", fixture.urlopen)
+    return fixture
+
+
+def syncer(source: Any, store: FakeStore, page_size: int = 100, reset: bool = False, **kwargs: Any) -> Any:
+    return sync.Syncer(source, store, SOURCE_URL, page_size, reset, **kwargs)
 
 
 def seeded_source() -> FakeSource:
@@ -256,7 +345,7 @@ def test_a_source_identity_change_is_refused_without_writing_rows() -> None:
     source.add_url("https://a.invalid/after.png", "carol", 3, 30)
     source.requests.clear()
 
-    assert sync.run(s, 5, once=False, sleep=lambda _: None) == 2
+    assert sync.run(s, 5, once=True) == 2
     assert store.error is not None and OTHER_UUID in store.error
     assert md5("https://a.invalid/after.png") not in store.urls
     assert source.requests == []
@@ -356,3 +445,156 @@ def test_a_source_head_below_the_replicated_block_is_an_error() -> None:
 def test_page_size_outside_the_source_cap_is_rejected(page_size: int) -> None:
     with pytest.raises(ValueError):
         syncer(FakeSource(head=1), FakeStore(), page_size=page_size)
+
+
+def test_a_source_identity_change_without_once_waits_and_resumes_when_the_identity_returns() -> None:
+    source, store = seeded_source(), FakeStore()
+    s = syncer(source, store)
+    s.cycle()
+    source.uuid = OTHER_UUID
+    source.head = 30
+    source.add_url("https://a.invalid/after.png", "carol", 3, 30)
+    source.requests.clear()
+    sleeps: list[tuple[float, int | None, str | None]] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append((seconds, store.source_block, store.error))
+        if len(sleeps) == 3:
+            source.uuid = UUID
+        if len(sleeps) == 4:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        sync.run(s, 5, once=False, sleep=sleep)
+    assert [t[0] for t in sleeps] == [5, 5, 5, 5], "the identity is checked again every poll interval, no backoff"
+    for _, block, error in sleeps[:3]:
+        assert block == 20
+        assert error is not None and OTHER_UUID in error and UUID in error
+    assert store.errors_set == 1, "sync_error is written once, not on every check"
+    assert sleeps[3][1:] == (30, None), "the first poll after the identity returned replicates and clears sync_error"
+    assert md5("https://a.invalid/after.png") in store.urls
+    assert store.resets == 0 and store.uuid == UUID
+
+
+def test_rebuild_truncates_and_bootstraps_again_from_an_unchanged_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    source, store = seeded_source(), FakeStore()
+    syncer(source, store).cycle()
+    # cli/blacklist.py remove-all on the primary: deletions are not streamed.
+    source.rows["url_authors"] = [r for r in source.rows["url_authors"] if r["account_name"] != "bob"]
+    source.rows["urls"] = [r for r in source.rows["urls"] if r["url"] != "https://a.invalid/2.png"]
+    source.blacklisted_urls = []
+    syncer(source, store).cycle()
+    assert md5("https://a.invalid/2.png") in store.urls
+    source.requests.clear()
+    bootstrap_complete_while_applying: list[bool] = []
+    apply_page = store.apply_page
+
+    def recording_apply_page(*args: Any) -> None:
+        bootstrap_complete_while_applying.append(store.bootstrap_complete)
+        apply_page(*args)
+    monkeypatch.setattr(store, "apply_page", recording_apply_page)
+
+    assert sync.run(syncer(source, store, rebuild=True), 5, once=True) == 0
+    assert store.resets == 1 and store.uuid == UUID
+    assert bootstrap_complete_while_applying == [False] * 4
+    assert set(store.urls.values()) == {"https://a.invalid/1.png"}
+    assert store.url_authors == {(md5("https://a.invalid/1.png"), "alice")}
+    assert store.bootstrap_complete and store.source_block == 20
+    assert [r[1] for r in source.requests] == [0] * 4, "every stream starts again at block 0"
+
+
+def test_the_rebuild_environment_variable_is_honoured_once_until_it_is_seen_unset() -> None:
+    source, store = seeded_source(), FakeStore()
+    syncer(source, store).cycle()
+
+    def start(rebuild_env: bool) -> None:
+        assert sync.run(syncer(source, store, rebuild_from_env=rebuild_env), 5, once=True) == 0
+
+    start(rebuild_env=True)
+    assert store.resets == 1 and store.rebuild_env_honoured
+    start(rebuild_env=True)
+    assert store.resets == 1, "a restart with the variable still set does not rebuild again"
+    start(rebuild_env=False)
+    assert store.resets == 1 and not store.rebuild_env_honoured
+    start(rebuild_env=True)
+    assert store.resets == 2
+    assert len(store.urls) == 2 and store.bootstrap_complete
+
+
+def test_a_rebuild_happens_once_per_process_not_every_cycle() -> None:
+    source, store = seeded_source(), FakeStore()
+    s = syncer(source, store, rebuild=True)
+    s.cycle()
+    source.head = 21
+    s.cycle()
+    assert store.resets == 1 and store.source_block == 21
+
+
+@pytest.mark.parametrize("failure", [lambda: http_error(504), lambda: http_error(502), lambda: TimeoutError("timed out"),
+                                     lambda: urllib.error.URLError(TimeoutError("timed out"))],
+                         ids=["504", "502", "read-timeout", "connect-timeout"])
+def test_a_page_the_source_path_gives_up_on_is_retried_with_half_the_page_size(
+        http: HttpFixture, failure: Any, caplog: pytest.LogCaptureFixture) -> None:
+    store = FakeStore()
+    s = syncer(sync.HttpSource(SOURCE_URL), store, page_size=4000)
+    http.failures["urls"] = [failure()]
+    with caplog.at_level(logging.INFO, logger="proxy_whitelist_replica"):
+        assert sync.run(s, 5, once=True) == 0
+
+    url_requests = [r for r in http.page_requests if r[0] == "urls"]
+    assert [(r[1], r[2], r[3]) for r in url_requests] == [(0, {}, 4000), (0, {}, 2000)], \
+        "the retry starts from the same cursor"
+    assert url_requests[0][4] != "ok" and url_requests[1][4] == "ok"
+    assert store.error is None and len(store.urls) == 2 and store.cursors["urls"] == sync.Cursor(20)
+    assert "urls: " in caplog.text and "retrying with page_size 2000 instead of 4000" in caplog.text
+    assert "urls: page_size 2000 passed; back to 4000" in caplog.text
+
+    http.source.head = 21
+    s.cycle()
+    assert [r[3] for r in http.page_requests if r[0] == "urls"][-1] == 4000
+
+
+def test_a_page_still_failing_at_the_minimum_page_size_is_a_sync_error_that_keeps_the_cursor(http: HttpFixture) -> None:
+    store = FakeStore()
+    http.failures["urls"] = [http_error(504) for _ in range(4)]
+    assert sync.run(syncer(sync.HttpSource(SOURCE_URL), store, page_size=4000), 5, once=True) == 1
+
+    assert [r[3] for r in http.page_requests if r[0] == "urls"] == [4000, 2000, sync.MIN_PAGE_SIZE]
+    assert store.error is not None and store.error.startswith("urls at cursor -1:") and "HTTP 504" in store.error
+    assert store.cursors["urls"] == sync.Cursor() and store.cursors["accounts"] == sync.Cursor(20)
+
+
+def test_a_page_size_below_the_minimum_is_not_halved(http: HttpFixture) -> None:
+    store = FakeStore()
+    http.failures["urls"] = [http_error(504)]
+    assert sync.run(syncer(sync.HttpSource(SOURCE_URL), store, page_size=100), 5, once=True) == 1
+    assert [r[3] for r in http.page_requests if r[0] == "urls"] == [100]
+
+
+def test_a_csv_field_over_the_limit_is_a_sync_error_and_retried(http: HttpFixture) -> None:
+    store = FakeStore()
+    oversized = "https://a.invalid/" + "x" * sync.CSV_FIELD_SIZE_LIMIT
+    http.bodies["urls"] = f"first_block,md5,url\r\n10,{md5(oversized)},{oversized}\r\n".encode()
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            assert store.error is not None and "field larger than field limit" in store.error
+            assert store.cursors["urls"] == sync.Cursor()
+            del http.bodies["urls"]
+        else:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        sync.run(syncer(sync.HttpSource(SOURCE_URL), store), 5, once=False, sleep=sleep)
+    assert sleeps == [sync.RETRY_SLEEP_S, 5]
+    assert store.error is None and len(store.urls) == 2
+
+
+def test_csv_fields_above_the_csv_module_default_limit_are_read(http: HttpFixture) -> None:
+    store = FakeStore()
+    long_url = "https://a.invalid/" + "y" * 200_000
+    http.source.add_url(long_url, "alice", 1, 18)
+    assert sync.run(syncer(sync.HttpSource(SOURCE_URL), store), 5, once=True) == 0
+    assert store.urls[md5(long_url)] == long_url

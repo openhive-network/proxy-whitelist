@@ -6,8 +6,10 @@ ARG PSQL_CLIENT_VERSION=da9ffb6003edfb5cbaf1dfcde8e1847667af7d24
 FROM registry.gitlab.syncad.com/hive/common-ci-configuration/psql:${PSQL_CLIENT_VERSION} AS psql_client
 
 USER root
-# py3-psycopg (psycopg 3) for the replica syncer, replica/sync.py.
-RUN apk add --no-cache curl py3-psycopg
+# psycopg 3 for the replica syncer, replica/sync.py. The base's Alpine (3.16)
+# has no py3-psycopg package, so it comes from PyPI (a musllinux wheel).
+RUN apk add --no-cache curl py3-pip \
+ && python3 -m pip install --no-cache-dir 'psycopg[binary]>=3.1,<4'
 
 USER haf_admin
 WORKDIR /home/haf_admin

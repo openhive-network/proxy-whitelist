@@ -3,6 +3,7 @@
 
     replica_smoke.py sync OUT_DIR    bootstrap the replica from the installed primary
     replica_smoke.py smoke OUT_DIR   seed the primary and check the replica follows it
+    replica_smoke.py health OUT_DIR  rebuild the replica and run its haproxy agent check
 
 Both serve the primary (PROXY_WHITELIST_TEST_USER_URL) and the replica
 (PROXY_WHITELIST_TEST_REPLICA_USER_URL, installed by run-checks' replica-install
@@ -16,10 +17,18 @@ app's processed block, like api_smoke.py), then checks, cycle by cycle: a
 PAGE_LIMIT=2 cycle over 5 urls of one block, byte-for-byte equal answers of
 check_url, is_whitelisted, url_accounts, avatar and cover, the replica's
 sync_status, 404 for /stream/*, new rows and empty cycles after bootstrap, a
-url author delivered below its url's block, an unreachable source and a
-changed source identity (refused, then --reset). Writes OUT_DIR/replica-<mode>.xml
-(one junit case per check); the seeded primary rows, block and sync_uuid are
-restored at the end.
+url author delivered below its url's block, an unreachable source, a
+changed source identity (refused, then --reset) and a forced rebuild (--rebuild,
+and PROXY_WHITELIST_REPLICA_REBUILD=1 honoured once). Writes
+OUT_DIR/replica-<mode>.xml (one junit case per check); the seeded primary rows,
+block and sync_uuid are restored at the end.
+
+health rebuilds the replica from the (restored) primary, then runs
+replica/healthcheck/proxy_whitelist_replica.sh against the replica's PostgREST
+admin server and database: up when in sync, down (exit 10) when last_block_time
+is older than 60 s, before the bootstrap completes and when PostgREST is not
+live. The testnet primary produces no blocks, so the age is set in the
+replica's state rather than waited for.
 """
 import contextlib
 import hashlib
@@ -28,8 +37,10 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -135,17 +146,19 @@ def rewriter(upstream: str) -> Iterator[str]:
 class Run:
     """The two APIs and the syncer of one mode's run."""
 
-    def __init__(self, out_dir: str, mode: str, primary: str, replica: str) -> None:
+    def __init__(self, out_dir: str, mode: str, primary: str, replica: str, admin: str | None = None) -> None:
         self.out_dir = out_dir
         self.mode = mode
         self.primary = primary
         self.replica = replica
+        self.admin = admin
         self.syncs = 0
 
-    def sync(self, *args: str, source: str | None = None, page_limit: int = 100000) -> int:
+    def sync(self, *args: str, source: str | None = None, page_limit: int = 100000, rebuild_env: str = "0") -> int:
         self.syncs += 1
         env = dict(os.environ, PROXY_WHITELIST_SOURCE_URL=source or self.primary, POSTGRES_URL=REPLICA_ADMIN_URL,
-                   PAGE_LIMIT=str(page_limit), PROXY_WHITELIST_REPLICA_RESET="0", LOG_LEVEL="DEBUG")
+                   PAGE_LIMIT=str(page_limit), PROXY_WHITELIST_REPLICA_RESET="0",
+                   PROXY_WHITELIST_REPLICA_REBUILD=rebuild_env, LOG_LEVEL="DEBUG")
         log_path = os.path.join(self.out_dir, self.log_name())
         with open(log_path, "w", encoding="utf-8") as log:
             return subprocess.run([sys.executable, str(ROOT / "replica" / "sync.py"), "--once", *args],
@@ -290,7 +303,9 @@ def check_sync_status_shape(run: Run) -> None:
     assert not missing, f"replica /sync-status lacks the primary's {missing}"
     extra = {"source_sync_uuid", "source_url", "polled_at", "bootstrap_complete", "sync_error"}
     assert extra <= set(status), f"replica /sync-status lacks {extra - set(status)}"
-    assert status["last_block_num"] == HEAD1 and status["sync_uuid"] == primary["sync_uuid"], f"{status} vs {primary}"
+    assert status["last_block_num"] == HEAD1 and status["source_sync_uuid"] == primary["sync_uuid"], f"{status} vs {primary}"
+    assert status["sync_uuid"] == replica_sql("select replica_sync_uuid from proxy_whitelist_replica.state") \
+        and status["sync_uuid"] != primary["sync_uuid"], f"the replica's sync_uuid in {status}, the primary's {primary['sync_uuid']}"
     assert status["source_url"] == run.primary and status["polled_at"], f"{status}"
 
 
@@ -369,6 +384,32 @@ def check_identity_change(run: Run) -> None:
     same_answers(run)
 
 
+def check_rebuild(run: Run) -> None:
+    # cli/blacklist.py remove-all style: a deletion on the primary that the streams do not carry
+    psql(f"""
+        set role proxy_whitelist_owner;
+        delete from proxy_whitelist_app.url_authors
+            where url_id = (select id from proxy_whitelist_app.urls where url = '{PAGE_URLS[4]}');
+        delete from proxy_whitelist_app.urls where url = '{PAGE_URLS[4]}';
+    """)
+    run.synced()
+    assert replica_sql(f"select count(*) from proxy_whitelist_app.urls where url = '{PAGE_URLS[4]}'") == "1"
+    before = run.status()["sync_uuid"]
+    run.synced("--rebuild")
+    status = run.status()
+    assert status["bootstrap_complete"] is True and status["sync_error"] is None, f"{status}"
+    assert status["sync_uuid"] != before, f"--rebuild kept the replica's sync_uuid {before}"
+    same_counts()
+    same_answers(run)
+
+    run.synced(rebuild_env="1")
+    rebuilt = run.status()["sync_uuid"]
+    assert rebuilt != status["sync_uuid"], "PROXY_WHITELIST_REPLICA_REBUILD=1 did not rebuild"
+    run.synced(rebuild_env="1")
+    assert run.status()["sync_uuid"] == rebuilt, "PROXY_WHITELIST_REPLICA_REBUILD=1 rebuilt again on a second start"
+    same_counts()
+
+
 SMOKE_CHECKS: list[tuple[str, Callable[[Run], None]]] = [
     ("a PAGE_LIMIT=2 cycle replicates exactly the 5 urls of one block", check_paged_cycle),
     ("check_url, is_whitelisted, url_accounts, avatar and cover answer like the primary", same_answers),
@@ -379,10 +420,65 @@ SMOKE_CHECKS: list[tuple[str, Callable[[Run], None]]] = [
     ("a url author below its url's block waits in pending_url_authors", check_pending_author),
     ("an unreachable source sets sync_error and freezes last_block_time; syncing resumes", check_unreachable_source),
     ("a changed sync_uuid is refused, --reset bootstraps again to equality", check_identity_change),
+    ("--rebuild and PROXY_WHITELIST_REPLICA_REBUILD=1 (once) bootstrap again to equality", check_rebuild),
 ]
+AGENT = ROOT / "replica" / "healthcheck" / "proxy_whitelist_replica.sh"
+# busybox date's -d "YYYY.MM.DD-HH:MM:SS" (check_http_sync_age.sh) for the suites' coreutils date.
+BUSYBOX_DATE = """#!/bin/bash
+args=()
+for a in "$@"; do
+  if [[ $a =~ ^([0-9]{4})\\.([0-9]{2})\\.([0-9]{2})-(.*)$ ]]; then
+    a="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}"
+  fi
+  args+=("$a")
+done
+exec %s "${args[@]}"
+"""
+
+
+def agent(live_url: str) -> tuple[int, str]:
+    """One run of the agent check: its exit status and its answer."""
+    with tempfile.TemporaryDirectory() as bin_dir:
+        date = pathlib.Path(bin_dir) / "date"
+        date.write_text(BUSYBOX_DATE % shutil.which("date"))
+        date.chmod(0o755)
+        env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}",
+                   REPLICA_LIVE_URL=live_url, REPLICA_POSTGRES_URL=REPLICA_USER_URL)
+        done = subprocess.run(["sh", str(AGENT)], env=env, capture_output=True, text=True, timeout=30)
+    return done.returncode, done.stdout.strip() + done.stderr.strip()
+
+
+def check_health(run: Run) -> None:
+    run.synced("--rebuild")
+    same_counts()
+    assert run.admin, "no PostgREST admin server"
+    live = f"{run.admin}/live"
+    state = replica_sql("select source_block_num, source_block_time from proxy_whitelist_replica.state")
+    try:
+        replica_sql("update proxy_whitelist_replica.state set source_block_time = now()")
+        assert agent(live) == (0, "up"), f"in sync: {agent(live)}"
+        replica_sql("update proxy_whitelist_replica.state set source_block_time = now() - interval '2 minutes'")
+        rc, answer = agent(live)
+        assert (rc, answer.split(" (")[0]) == (10, "down #proxy_whitelist_replica block too old"), f"stale: {rc} {answer!r}"
+        assert agent(f"http://127.0.0.1:{free_port()}/live") == (10, "down #proxy_whitelist_replica postgrest not live")
+        replica_sql("update proxy_whitelist_replica.state set source_block_num = null, source_block_time = null, "
+                    "bootstrap_complete = false")
+        assert agent(live) == (10, "down #proxy_whitelist_replica has no processed block yet"), f"{agent(live)}"
+    finally:
+        block, _, time_ = state.partition("|")
+        replica_sql(f"update proxy_whitelist_replica.state set bootstrap_complete = true, "
+                    f"source_block_num = {block or 'null'}, source_block_time = {repr(time_) if time_ else 'null'}")
+    code = [line for p in AGENT.parent.glob("*.sh") for line in p.read_text().splitlines()
+            if not line.lstrip().startswith("#")]
+    haf = [line for line in code if re.search(r"\b(hive|hafd)\.", line)]
+    assert not haf, f"the replica agent queries HAF: {haf}"
+
+
 MODES: dict[str, list[tuple[str, Callable[[Run], None]]]] = {
     "sync": [("a fresh replica bootstraps from the primary", check_bootstrap)],
     "smoke": SMOKE_CHECKS,
+    "health": [("the haproxy agent check answers up in sync, down when stale, unbootstrapped or not live",
+                check_health)],
 }
 
 
@@ -393,14 +489,15 @@ def main(mode: str, out_dir: str) -> int:
         try:
             primary = stack.enter_context(rewriter(stack.enter_context(
                 postgrest(USER_URL, os.path.join(out_dir, f"replica-{mode}-primary-postgrest.log")))))
+            admin_port = free_port()
             replica = stack.enter_context(rewriter(stack.enter_context(
-                postgrest(REPLICA_USER_URL, os.path.join(out_dir, f"replica-{mode}-postgrest.log")))))
+                postgrest(REPLICA_USER_URL, os.path.join(out_dir, f"replica-{mode}-postgrest.log"), admin_port))))
         except PostgrestDidNotStart as exc:
             print(exc, file=sys.stderr)
             results.append(("postgrest start", 0.0, str(exc)))
             write_junit(os.path.join(out_dir, f"replica-{mode}.xml"), results)
             return 1
-        run = Run(out_dir, mode, primary, replica)
+        run = Run(out_dir, mode, primary, replica, f"http://127.0.0.1:{admin_port}")
         for name, check in MODES[mode]:
             t0 = time.time()
             error = ""
