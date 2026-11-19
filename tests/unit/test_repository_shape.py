@@ -8,16 +8,16 @@ INSTALL = (ROOT / "scripts" / "install_app.sh").read_text()
 ENDPOINT_SQL = "\n".join(p.read_text() for p in sorted((ROOT / "endpoints").glob("*.sql")))
 
 
-def sql_files():
+def sql_files() -> list[str]:
     return sorted(str(p.relative_to(ROOT)) for d in ("db", "endpoints") for p in (ROOT / d).glob("*.sql"))
 
 
-def test_every_sql_file_is_applied_by_install_app():
+def test_every_sql_file_is_applied_by_install_app() -> None:
     missing = [f for f in sql_files() if f'$SRCPATH/{f}"' not in INSTALL]
     assert not missing, f"not applied by scripts/install_app.sh: {missing}"
 
 
-def test_rewrite_rules_point_at_installed_endpoint_functions():
+def test_rewrite_rules_point_at_installed_endpoint_functions() -> None:
     rules = (ROOT / "rewrite_rules.conf").read_text()
     targets = re.findall(r"\s/rpc/([a-z_]+)[\s?]", rules)
     assert targets, "rewrite_rules.conf names no /rpc/ targets"
@@ -26,13 +26,13 @@ def test_rewrite_rules_point_at_installed_endpoint_functions():
     assert not missing, f"rewrite targets without an endpoint function: {missing}"
 
 
-def test_check_url_accepts_the_callers_account_blacklist():
+def test_check_url_accepts_the_callers_account_blacklist() -> None:
     # proxy-whitelist!4: the imagehoster sends blacklisted_accounts with every check.
     assert re.search(r'check_url\(\s*"url"\s+TEXT\s*,\s*"blacklisted_accounts"\s+TEXT\[\]', ENDPOINT_SQL), \
         "check_url(url text, blacklisted_accounts text[]) is not declared in endpoints/whitelist_check.sql"
 
 
-def test_tracked_text_files_use_lf_line_endings():
+def test_tracked_text_files_use_lf_line_endings() -> None:
     # .gitattributes: * text=auto eol=lf
     crlf = []
     for p in ROOT.rglob("*"):
