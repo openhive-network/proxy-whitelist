@@ -39,7 +39,11 @@
 #   - replica-smoke   .aidev/replica_smoke.py smoke: the primary seeded and followed
 #                     cycle by cycle (paging, new and quiet blocks, a pending url
 #                     author, an unreachable source, a changed sync_uuid and
-#                     --reset), the replica's answers compared byte for byte
+#                     --reset, --rebuild), the replica's answers compared byte for byte
+#   - replica-health  .aidev/replica_smoke.py health: the replica rebuilt from the
+#                     primary, then replica/healthcheck/proxy_whitelist_replica.sh
+#                     (haproxy's agent check) up in sync, down when stale,
+#                     unbootstrapped or PostgREST not live
 #
 # Reports go to test-results/<suite>/: junit.xml (one case per step) plus one log
 # per step, and the per-call junit of api-smoke.
@@ -189,6 +193,9 @@ replica_install() {
         || { echo "stream functions installed on the replica"; return 1; }
     [ "$(replica_query "select proxy_whitelist_endpoints.sync_status()->>'bootstrap_complete'")" = false ] \
         || { echo "sync_status() of a fresh replica is not bootstrap_complete = false"; return 1; }
+    [ "$(replica_query "select (s->>'sync_uuid') is not null and s->>'source_sync_uuid' is null
+                        from proxy_whitelist_endpoints.sync_status() s")" = t ] \
+        || { echo "sync_status() of a fresh replica lacks its own sync_uuid or has a source's"; return 1; }
     echo "replica schema, state and endpoints present, no stream endpoints"
 }
 
@@ -204,6 +211,7 @@ for s in "$@"; do
         replica-install) step replica-install replica_install ;;
         replica-sync) step replica-sync python3 .aidev/replica_smoke.py sync "$out" ;;
         replica-smoke) step replica-smoke python3 .aidev/replica_smoke.py smoke "$out" ;;
+        replica-health) step replica-health python3 .aidev/replica_smoke.py health "$out" ;;
         *) echo "unknown step: $s" >&2; exit 2 ;;
     esac
 done

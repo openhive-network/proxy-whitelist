@@ -80,7 +80,10 @@ CREATE TABLE IF NOT EXISTS proxy_whitelist_replica.pending_url_authors (
  * a NULL key means every row up to and including the block is applied, so
  * the next page starts at block + 1; -1 is the cursor before block 0.
  * source_block_num/source_block_time are the source's head the replica has
- * fully replicated, i.e. what sync_status() reports.
+ * fully replicated, i.e. what sync_status() reports. replica_sync_uuid is the
+ * replica's own identity, minted with the row, so anew by every reset or
+ * rebuild. rebuild_env_honoured records that a rebuild was done for
+ * PROXY_WHITELIST_REPLICA_REBUILD=1, so later starts with it still set skip it.
  */
 CREATE TABLE IF NOT EXISTS proxy_whitelist_replica.state (
   id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
@@ -101,8 +104,15 @@ CREATE TABLE IF NOT EXISTS proxy_whitelist_replica.state (
   source_block_time TIMESTAMPTZ NULL,
   polled_at TIMESTAMPTZ NULL,
   sync_error TEXT NULL,
-  bootstrap_complete BOOLEAN NOT NULL DEFAULT FALSE
+  bootstrap_complete BOOLEAN NOT NULL DEFAULT FALSE,
+  replica_sync_uuid UUID NOT NULL DEFAULT gen_random_uuid(),
+  rebuild_env_honoured BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+-- Columns added after the first release, for replicas installed before them.
+ALTER TABLE proxy_whitelist_replica.state
+ADD COLUMN IF NOT EXISTS replica_sync_uuid UUID NOT NULL DEFAULT gen_random_uuid(),
+ADD COLUMN IF NOT EXISTS rebuild_env_honoured BOOLEAN NOT NULL DEFAULT FALSE;
 
 INSERT INTO proxy_whitelist_replica.state (id) VALUES (TRUE)
 ON CONFLICT (id) DO NOTHING;

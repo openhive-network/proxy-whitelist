@@ -23,6 +23,9 @@ services:
       POSTGRES_PASSWORD: ${REPLICA_DB_PASSWORD:?set REPLICA_DB_PASSWORD in replica/.env}
     volumes:
       - replica-db-data:/var/lib/postgresql
+    ports:
+      # for a health check agent run on the host (the replica-agent service uses the compose network)
+      - "127.0.0.1:${REPLICA_DB_PORT:-5433}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d proxy_whitelist"]
       interval: 5s
@@ -49,6 +52,7 @@ services:
       POLL_INTERVAL_S: ${POLL_INTERVAL_S:-5}
       PAGE_LIMIT: ${PAGE_LIMIT:-100000}
       PROXY_WHITELIST_REPLICA_RESET: ${PROXY_WHITELIST_REPLICA_RESET:-0}
+      PROXY_WHITELIST_REPLICA_REBUILD: ${PROXY_WHITELIST_REPLICA_REBUILD:-0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       replica-install:
@@ -87,6 +91,21 @@ services:
       - "${REPLICA_HTTP_BIND:-127.0.0.1:7010}:80"
     depends_on:
       - replica-postgrest
+    restart: always
+
+  # haproxy agent-check: "up" or "down #reason" per connection
+  # (replica/healthcheck/proxy_whitelist_replica.sh)
+  replica-agent:
+    <<: *proxy-whitelist-image
+    command: ["replica_agent"]
+    environment:
+      REPLICA_LIVE_URL: http://replica-postgrest:3001/live
+      REPLICA_POSTGRES_URL: postgresql://proxy_whitelist_user:${REPLICA_API_PASSWORD}@replica-db/proxy_whitelist
+    ports:
+      - "${REPLICA_AGENT_BIND:-127.0.0.1:7015}:7015"
+    depends_on:
+      replica-install:
+        condition: service_completed_successfully
     restart: always
 
 volumes:
