@@ -1,0 +1,64 @@
+# The service stack .aidev/project.yaml's `sandbox:` runs for the install and
+# api-smoke steps: a HAF testnet with hafah, reputation_tracker and hivemind
+# installed (hivemind's setup needs the first two; proxy-whitelist's
+# install_app.sh needs the hivemind role and hivemind's application-registry row).
+# Pins follow hivesense's .aidev/test-stack.compose.yml (HAF `develop`, apps 1.28.8-rc3).
+x-haf-upstream-branch: "develop"
+x-apps-release: "1.28.8-rc3"
+x-haf-client: &haf-client
+  depends_on:
+    haf:
+      condition: service_healthy
+services:
+  haf:
+    image: &haf-image registry.gitlab.syncad.com/hive/haf/testnet:2712c138@sha256:cc0a38ec48cece04ecedda65160d0701c599ebead07f183d1c56e92aa9063f59
+    command: ["--execute-maintenance-script=/home/hived/source/./scripts/maintenance-scripts/sleep_infinity.sh"]
+    environment:
+      PGCTLTIMEOUT: "600"
+      PG_ACCESS: |
+        host    all              all              0.0.0.0/0    trust
+    healthcheck:
+      test: ["CMD-SHELL", "psql -h 127.0.0.1 -U haf_admin -d haf_block_log -Atc \"select 1 from pg_extension where extname = 'hive_fork_manager'\" | grep -qx 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+  haf-init:
+    <<: *haf-client
+    image: *haf-image
+    entrypoint: ["/usr/lib/postgresql/18/bin/psql", "postgresql://haf_admin@haf/haf_block_log", "-v", "ON_ERROR_STOP=on", "-c", "select hive.initialize_extension_data()"]
+  hafah-install:
+    image: registry.gitlab.syncad.com/hive/hafah:1.28.8-rc3@sha256:6c180ce9cb37671f1639776c9fb1829c33c34bae31f31884f3b14c5af9105997
+    environment:
+      POSTGRES_URL: postgresql://haf_admin@haf/haf_block_log
+    command: ["install_app", "--swagger-url=localhost"]
+    depends_on:
+      haf-init:
+        condition: service_completed_successfully
+  reputation-tracker-install:
+    image: registry.gitlab.syncad.com/hive/reputation_tracker:1.28.8-rc3@sha256:ccfaf79a072bece9eb036f83be012f6fa7129280197f2c81880a3b3e108b6d58
+    environment:
+      POSTGRES_HOST: haf
+    command: ["install_app", "--swagger-url=localhost", "--is_forking=TRUE"]
+    depends_on:
+      haf-init:
+        condition: service_completed_successfully
+  hivemind-install:
+    image: registry.gitlab.syncad.com/hive/hivemind:1.28.8-rc3@sha256:4b05d408775e8c38b6b86b4dacc7f5acac1bb8972545c83980cf5efa3bfcfd64
+    command: ["setup", "--database-admin-url=postgresql://haf_admin@haf/haf_block_log", "--statement-timeout=5000", "--swagger-url=localhost"]
+    depends_on:
+      hafah-install:
+        condition: service_completed_successfully
+      reputation-tracker-install:
+        condition: service_completed_successfully
+  ready:
+    image: *haf-image
+    entrypoint: ["sleep", "infinity"]
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/lib/postgresql/18/bin/psql postgresql://haf_admin@haf/haf_block_log -Atc \"select 1 from pg_namespace where nspname = 'hivemind_endpoints'\" | grep -qx 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 120
+    depends_on:
+      hivemind-install:
+        condition: service_completed_successfully

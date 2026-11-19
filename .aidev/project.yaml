@@ -1,0 +1,70 @@
+# Profile for hive/proxy-whitelist, started by `aidev project scaffold` (#13561) and
+# edited for this project's topology and stack. Schema: docs/architecture/project-profile.md
+# (aidev). Onboarding record: aidev docs/operations/onboarding-an-external-project.md.
+version: 2
+project: proxy-whitelist
+gitlab:
+  host: "gitlab.syncad.com"
+  path: "hive/proxy-whitelist"
+  id: 569
+branches:
+  integration: "aidev/integration"
+  handoff: "main"
+# The suites run in common-ci-configuration's python-test-tools image (python,
+# shellcheck, sqlfluff, psql, pytest, postgrest) plus psycopg and HAF's
+# install_with_app_lock.py, built from .aidev/runtime/Dockerfile.
+environment:
+  kind: "container"
+  build: {dockerfile: ".aidev/runtime/Dockerfile", context: ".aidev/runtime"}
+  base: {image: "registry.gitlab.syncad.com/hive/common-ci-configuration/python-test-tools:develop", follow: true}
+  image: "registry.gitlab.syncad.com/hive/common-ci-configuration/python-test-tools@sha256:e19194941631ce299ccb41ad7e924472e8e89b44468461cea348a7b220623e6d"
+  inputs: [".aidev/runtime/Dockerfile"]
+issues:
+  intake_label: todo
+  taxonomy: ".aidev/labels.yaml"
+  decompose:
+    auto_todo: never
+  watcher_reports: self
+# A HAF testnet with hivemind installed: install_app.sh needs the hivemind role and
+# hivemind's row in HAF's application registry.
+sandbox:
+  compose: .aidev/test-stack.compose.yml
+  resource_class: light
+  services: [haf, haf-init, hafah-install, reputation-tracker-install, hivemind-install, ready]
+  readiness_timeout: 600
+  env:
+    PROXY_WHITELIST_TEST_DB_HOST: haf
+# One junit report per suite from .aidev/run-checks.sh; each step is a case.
+verification:
+  quick:
+    adapter: command
+    args: [".aidev/run-checks.sh", "quick", "shellcheck", "sqlfluff", "unit", "sql-registered"]
+    stack: false
+    artifacts: ["test-results/quick/"]
+  full:
+    adapter: command
+    args: [".aidev/run-checks.sh", "full", "shellcheck", "sqlfluff", "unit", "sql-registered", "install", "reinstall", "api-smoke"]
+    artifacts: ["test-results/full/"]
+  baseline:
+    adapter: command
+    args: [".aidev/run-checks.sh", "baseline", "install", "reinstall", "api-smoke"]
+    artifacts: ["test-results/baseline/"]
+  canary:
+    adapter: command
+    args: [".aidev/run-checks.sh", "canary", "shellcheck", "sqlfluff", "unit", "sql-registered", "install", "reinstall", "api-smoke"]
+    artifacts: ["test-results/canary/"]
+  static:
+    adapter: command
+    args: [".aidev/run-checks.sh", "static", "shellcheck", "sqlfluff"]
+    stack: false
+    artifacts: ["test-results/static/"]
+  coverage:
+    adapter: command
+    args: [".aidev/run-checks.sh", "coverage", "unit", "sql-registered"]
+    stack: false
+    artifacts: ["test-results/coverage/"]
+  system:
+    adapter: command
+    args: [".aidev/run-checks.sh", "system", "install", "api-smoke"]
+    artifacts: ["test-results/system/"]
+capabilities: []
