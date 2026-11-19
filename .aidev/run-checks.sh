@@ -20,13 +20,15 @@
 #                     then the schema, the endpoint schema and the HAF context exist,
 #                     and every tests/sql/*.sql check passes against the installed app
 #   - reinstall       install_app.sh a second time over the installed app (there is
-#                     no uninstall script; the installer is idempotent) and the
-#                     endpoint schema is still there
+#                     no uninstall script; the installer is idempotent), the
+#                     endpoint schema is still there and the stream source
+#                     identity (app_status.sync_uuid) is unchanged
 #   - api-smoke       .aidev/api_smoke.py: PostgREST on the installed schema as
 #                     production runs it, then check_url through unknown →
 #                     whitelisted → blacklisted, the blacklisted_accounts form,
-#                     url_accounts, sync_status and the root spec (one junit case
-#                     per call in $out/api-smoke.xml)
+#                     url_accounts, sync_status, the root spec, the /stream/*
+#                     pages and avatar/cover (one junit case per call in
+#                     $out/api-smoke.xml)
 #
 # Reports go to test-results/<suite>/: junit.xml (one case per step) plus one log
 # per step, and the per-call junit of api-smoke.
@@ -133,8 +135,13 @@ install() {
     sql_checks
 }
 reinstall() {
+    local before after
+    before="$(query "select sync_uuid from proxy_whitelist_app.app_status")" || return 1
     install_app || return 1
-    installed_ok
+    installed_ok || return 1
+    after="$(query "select sync_uuid from proxy_whitelist_app.app_status")" || return 1
+    [ -n "$before" ] && [ "$before" = "$after" ] || { echo "sync_uuid changed on reinstall: '$before' -> '$after'"; return 1; }
+    echo "sync_uuid kept: $after"
 }
 
 for s in "$@"; do

@@ -153,6 +153,10 @@ psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on -c "
   END
   \$\$;"
 
+# One-time fill of account_profiles from hivemind's accounts (a no-op once done)
+psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
+  -c "SET ROLE proxy_whitelist_owner; SELECT ${PROXY_WHITELIST_SCHEMA}.backfill_account_profiles();"
+
 # Install endpoint schema (PostgREST API)
 psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
   -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
@@ -169,6 +173,14 @@ psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
 psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
   -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
   -f "$SRCPATH/endpoints/sync_status.sql"
+
+psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
+  -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
+  -f "$SRCPATH/endpoints/stream.sql"
+
+psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
+  -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \
+  -f "$SRCPATH/endpoints/avatar.sql"
 
 # Grant permissions
 psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
