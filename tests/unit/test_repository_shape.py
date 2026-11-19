@@ -42,6 +42,22 @@ def test_check_url_accepts_the_callers_account_blacklist() -> None:
         "check_url(url text, blacklisted_accounts text[]) is not declared in endpoints/whitelist_check.sql"
 
 
+def test_ci_shellcheck_runs_at_the_gates_floor() -> None:
+    # .aidev/run-checks.sh lints at -S warning; a CI default-severity run fails on
+    # info findings the gate never sees (SC1091 broke the handoff pipeline once).
+    ci = (ROOT / ".gitlab-ci.yml").read_text()
+    job = re.search(r"^lint_bash_scripts:\n((?:[ \t].*\n|\n)*)", ci, re.MULTILINE)
+    assert job, "no lint_bash_scripts job in .gitlab-ci.yml"
+    calls = re.findall(r"shellcheck\s[^|\n]*", job.group(1))
+    assert calls, "lint_bash_scripts does not run shellcheck"
+    for call in calls:
+        flags = call.split()
+        assert "-x" in flags, f"lint_bash_scripts shellcheck does not follow sources: {call}"
+        assert re.search(r"(^|\s)-S warning(\s|$)", call), f"lint_bash_scripts shellcheck is not at -S warning: {call}"
+    for xslt in re.findall(r"xmlstarlet tr (\S+)", job.group(1)):
+        assert (ROOT / xslt).is_file(), f"lint_bash_scripts converts with a missing {xslt}"
+
+
 def test_tracked_text_files_use_lf_line_endings() -> None:
     # .gitattributes: * text=auto eol=lf
     crlf = []

@@ -23,6 +23,7 @@ adjust_age_for_ci() {
   echo "$1"
 }
 
+# shellcheck source=replica/healthcheck/check_http_sync_age.sh
 . "$(dirname "$0")/check_http_sync_age.sh"
 
 if [ -z "${REPLICA_POSTGRES_URL:-}" ]; then

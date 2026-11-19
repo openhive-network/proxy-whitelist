@@ -24,6 +24,7 @@
 # TIME_OFFSET / adjust_age_for_ci CI-offset machinery defined there (and set
 # up by the check_haf_lib call).
 
+# shellcheck source=replica/healthcheck/format_seconds.sh
 . "$(dirname "$0")/format_seconds.sh"
 
 HTTP_CHECK_TIMEOUT="${HTTP_CHECK_TIMEOUT:-5}"
