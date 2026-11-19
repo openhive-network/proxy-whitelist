@@ -19,7 +19,7 @@ def test_every_sql_file_is_applied_by_install_app():
 
 def test_rewrite_rules_point_at_installed_endpoint_functions():
     rules = (ROOT / "rewrite_rules.conf").read_text()
-    targets = re.findall(r"\s/rpc/([a-z_]+)\s", rules)
+    targets = re.findall(r"\s/rpc/([a-z_]+)[\s?]", rules)
     assert targets, "rewrite_rules.conf names no /rpc/ targets"
     defined = set(re.findall(r"FUNCTION\s+proxy_whitelist_endpoints\.([a-z_]+)", ENDPOINT_SQL))
     missing = [t for t in targets if t not in defined]

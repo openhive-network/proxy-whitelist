@@ -34,6 +34,19 @@ BEGIN
   ALTER TABLE proxy_whitelist_app.app_status
     DROP COLUMN IF EXISTS redis_password;
 
+  -- Stream source identity: sync_uuid is minted once (the volatile default is
+  -- evaluated only when the column is added or the row is first inserted) and
+  -- tells a replica it is still reading the database it bootstrapped from.
+  ALTER TABLE proxy_whitelist_app.app_status
+    ADD COLUMN IF NOT EXISTS sync_uuid UUID NOT NULL DEFAULT gen_random_uuid();
+  ALTER TABLE proxy_whitelist_app.app_status
+    ADD COLUMN IF NOT EXISTS stream_schema_version INT NOT NULL DEFAULT 1;
+  -- The block every row that predates the stream columns is labelled with.
+  ALTER TABLE proxy_whitelist_app.app_status
+    ADD COLUMN IF NOT EXISTS stream_sentinel_block INT;
+  ALTER TABLE proxy_whitelist_app.app_status
+    ADD COLUMN IF NOT EXISTS account_profiles_backfilled BOOLEAN NOT NULL DEFAULT FALSE;
+
   IF NOT hive.app_context_exists(__schema_name) THEN
     PERFORM hive.app_create_context(
       _name => __schema_name,
@@ -117,5 +130,54 @@ VALUES (
   current_setting('PG_TEMP.ADVISORY_LOCK_NAMESPACE_BEGIN', TRUE)::INT
 )
 ON CONFLICT (id) DO NOTHING;
+
+-- Block coordinates for the replication streams (endpoints/stream.sql). Runs
+-- once: the sentinel is recorded on the first install that has these columns,
+-- and the columns are added only when missing. Adding a NOT NULL column with a
+-- constant default is a catalog-only change in PostgreSQL 11+, so the existing
+-- rows of urls/url_authors are not rewritten; the default is then dropped so
+-- that every insert site has to supply the block.
+DO $BODY$
+DECLARE
+  __schema_name VARCHAR;
+  __sentinel INT;
+  __table TEXT;
+BEGIN
+  SHOW SEARCH_PATH INTO __schema_name;
+
+  SELECT stream_sentinel_block INTO __sentinel FROM proxy_whitelist_app.app_status;
+  IF __sentinel IS NULL THEN
+    __sentinel := COALESCE(hive.app_get_current_block_num(__schema_name), 0);
+    UPDATE proxy_whitelist_app.app_status SET stream_sentinel_block = __sentinel;
+    RAISE NOTICE 'Stream sentinel block: %', __sentinel;
+  END IF;
+
+  FOREACH __table IN ARRAY ARRAY['urls', 'url_authors'] LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'proxy_whitelist_app' AND table_name = __table AND column_name = 'first_block'
+    ) THEN
+      EXECUTE format('ALTER TABLE proxy_whitelist_app.%I ADD COLUMN first_block INT NOT NULL DEFAULT %s', __table, __sentinel);
+      EXECUTE format('ALTER TABLE proxy_whitelist_app.%I ALTER COLUMN first_block DROP DEFAULT', __table);
+    END IF;
+  END LOOP;
+END
+$BODY$;
+
+CREATE INDEX IF NOT EXISTS urls_by_first_block
+ON proxy_whitelist_app.urls (first_block, md5(url));
+CREATE INDEX IF NOT EXISTS url_authors_by_first_block
+ON proxy_whitelist_app.url_authors (first_block, url_id);
+
+-- Current avatar/cover per account (no history), from the latest
+-- account_update/account_update2 seen for it.
+CREATE TABLE IF NOT EXISTS proxy_whitelist_app.account_profiles (
+  account_id INT PRIMARY KEY REFERENCES proxy_whitelist_app.accounts (id),
+  avatar_url TEXT NULL,
+  cover_url TEXT NULL,
+  updated_block INT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS account_profiles_by_updated_block
+ON proxy_whitelist_app.account_profiles (updated_block, account_id);
 
 RESET ROLE;

@@ -156,3 +156,45 @@ GRANT EXECUTE ON FUNCTION proxy_whitelist_app.extract_profile_urls(TEXT, TEXT)
     TO haf_admin WITH GRANT OPTION;
 GRANT EXECUTE ON FUNCTION proxy_whitelist_app.extract_profile_urls(TEXT, TEXT)
     TO proxy_whitelist_user;
+
+
+-- The account's avatar (profile_image) and cover (cover_image) URLs, with the
+-- parse rules of extract_profile_urls(). Where both metadata fields carry a
+-- key, posting_json_metadata (where current Hive frontends write the profile)
+-- wins over json_metadata.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.extract_profile_images(
+    posting_json_metadata TEXT,
+    json_metadata TEXT,
+    OUT avatar_url TEXT,
+    OUT cover_url TEXT
+)
+LANGUAGE plpython3u
+STABLE
+AS $BODY$
+    import json
+
+    found = {}
+
+    for raw in [posting_json_metadata, json_metadata]:
+        if not raw:
+            continue
+        try:
+            meta = json.loads(raw)
+            if not isinstance(meta, dict):
+                continue
+            profile = meta.get('profile', meta)
+            if isinstance(profile, dict):
+                for key in ('profile_image', 'cover_image'):
+                    val = profile.get(key)
+                    if key not in found and isinstance(val, str) and val.startswith('http'):
+                        found[key] = val
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+
+    return found.get('profile_image'), found.get('cover_image')
+$BODY$;
+
+GRANT EXECUTE ON FUNCTION proxy_whitelist_app.extract_profile_images(TEXT, TEXT)
+    TO haf_admin WITH GRANT OPTION;
+GRANT EXECUTE ON FUNCTION proxy_whitelist_app.extract_profile_images(TEXT, TEXT)
+    TO proxy_whitelist_user;

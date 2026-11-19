@@ -11,11 +11,14 @@ PROXY_WHITELIST_TEST_ADMIN_URL, and makes the calls of CHECKS in order:
 
   root spec, sync_status, check_url unknown → (seeded) whitelisted →
   (seeded author blacklisted by the caller) unknown → (url blacklisted) blacklisted,
-  url_accounts of the seeded URL.
+  url_accounts of the seeded URL, then the /stream/* pages (seeded at fixed
+  blocks, with the app's processed block moved past them), a profile change,
+  and avatar/cover.
 
 Writes OUT_DIR/api-smoke.xml (one junit case per call) and exits non-zero when any
-call fails. The seeded rows are removed at the end.
+call fails. The seeded rows are removed and the app's block restored at the end.
 """
+import hashlib
 import json
 import os
 import socket
@@ -24,13 +27,28 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
+from typing import Any, Callable
 from xml.sax.saxutils import escape, quoteattr
 
 STARTUP_TIMEOUT_S = 60
 ADMIN_URL = os.environ["PROXY_WHITELIST_TEST_ADMIN_URL"]
 USER_URL = os.environ["PROXY_WHITELIST_TEST_USER_URL"]
-SMOKE_URL = f"https://aidev.invalid/smoke/{int(time.time())}.png"
+SMOKE_PREFIX = f"https://aidev.invalid/smoke/{int(time.time())}"
+SMOKE_URL = f"{SMOKE_PREFIX}.png"
 SMOKE_ACCOUNT = "aidev-smoke"
+SMOKE_HIVE_ID = 2147000001
+PLAIN_ACCOUNT = "aidev-smoke-np"
+PLAIN_HIVE_ID = 2147000002
+UNKNOWN_ACCOUNT = "aidev-smoke-none"
+PAGE_URLS = [f"{SMOKE_PREFIX}-page-{i}.png" for i in range(5)]
+AVATAR, AVATAR2, COVER = (f"{SMOKE_PREFIX}-{n}.png" for n in ("avatar", "avatar2", "cover"))
+# Fixed blocks far above a testnet's: the streams serve only blocks the app has
+# processed, so seeding moves the app's block to STREAM_HEAD (restored by cleanup).
+URL_BLOCK, PAGE_BLOCK, PROFILE_BLOCK, CHANGE_BLOCK, STREAM_HEAD = (
+    900_000_010, 900_000_015, 900_000_020, 900_000_030, 900_000_100)
+_original_head = None
+_last_headers: dict[str, str] = {}
 
 
 def psql(sql: str) -> str:
@@ -52,6 +70,8 @@ def call(base: str, method: str, path: str, body=None):
                                  headers={"Content-Type": "application/json"} if data else {})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
+            _last_headers.clear()
+            _last_headers.update(resp.headers.items())
             raw = resp.read().decode()
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as err:
@@ -62,15 +82,42 @@ def call(base: str, method: str, path: str, body=None):
             return err.code, raw
 
 
+def md5(text: str) -> str:
+    return hashlib.md5(text.encode()).hexdigest()
+
+
 def seed_url() -> None:
+    global _original_head
+    _original_head = int(psql("select current_block_num from hafd.contexts where name = 'proxy_whitelist_app'"))
     psql(f"""
         set role proxy_whitelist_owner;
-        insert into proxy_whitelist_app.urls (url) values ('{SMOKE_URL}');
-        insert into proxy_whitelist_app.accounts (hive_id, name) values (2147000001, '{SMOKE_ACCOUNT}')
-            on conflict (name) do nothing;
-        insert into proxy_whitelist_app.url_authors (url_id, author_id)
-            select u.id, a.id from proxy_whitelist_app.urls u, proxy_whitelist_app.accounts a
-            where u.url = '{SMOKE_URL}' and a.name = '{SMOKE_ACCOUNT}';
+        select hive.app_set_current_block_num('proxy_whitelist_app', {STREAM_HEAD});
+        select proxy_whitelist_app.whitelist_urls(
+            array['{SMOKE_URL}'],
+            proxy_whitelist_app.ensure_account({SMOKE_HIVE_ID}, '{SMOKE_ACCOUNT}'),
+            {URL_BLOCK});
+    """)
+
+
+def seed_streams() -> None:
+    page_urls = ", ".join(f"'{u}'" for u in PAGE_URLS)
+    metadata = json.dumps({"profile": {"profile_image": AVATAR, "cover_image": COVER}})
+    psql(f"""
+        set role proxy_whitelist_owner;
+        select proxy_whitelist_app.whitelist_urls(
+            array[{page_urls}], proxy_whitelist_app.ensure_account({SMOKE_HIVE_ID}, '{SMOKE_ACCOUNT}'), {PAGE_BLOCK});
+        select proxy_whitelist_app.set_account_profile(
+            {SMOKE_HIVE_ID}, '{SMOKE_ACCOUNT}', img.avatar_url, img.cover_url, {PROFILE_BLOCK})
+        from proxy_whitelist_app.extract_profile_images(NULL, '{metadata}') img;
+        select proxy_whitelist_app.ensure_account({PLAIN_HIVE_ID}, '{PLAIN_ACCOUNT}');
+    """)
+
+
+def change_avatar() -> None:
+    psql(f"""
+        set role proxy_whitelist_owner;
+        select proxy_whitelist_app.set_account_profile(
+            {SMOKE_HIVE_ID}, '{SMOKE_ACCOUNT}', '{AVATAR2}', '{COVER}', {CHANGE_BLOCK});
     """)
 
 
@@ -83,27 +130,95 @@ def blacklist_url() -> None:
 
 
 def cleanup() -> None:
+    smoke_urls = f"(select id from proxy_whitelist_app.urls where url like '{SMOKE_PREFIX}%')"
+    smoke_accounts = f"(select id from proxy_whitelist_app.accounts where name in ('{SMOKE_ACCOUNT}', '{PLAIN_ACCOUNT}'))"
+    restore = (f"select hive.app_set_current_block_num('proxy_whitelist_app', {_original_head});"
+               if _original_head is not None else "")
     psql(f"""
         set role proxy_whitelist_owner;
-        delete from proxy_whitelist_app.blacklisted_urls
-            where url_id in (select id from proxy_whitelist_app.urls where url = '{SMOKE_URL}');
-        delete from proxy_whitelist_app.url_authors
-            where url_id in (select id from proxy_whitelist_app.urls where url = '{SMOKE_URL}');
-        delete from proxy_whitelist_app.urls where url = '{SMOKE_URL}';
-        delete from proxy_whitelist_app.accounts where name = '{SMOKE_ACCOUNT}';
+        delete from proxy_whitelist_app.blacklisted_urls where url_id in {smoke_urls};
+        delete from proxy_whitelist_app.url_authors where url_id in {smoke_urls};
+        delete from proxy_whitelist_app.urls where id in {smoke_urls};
+        delete from proxy_whitelist_app.account_profiles where account_id in {smoke_accounts};
+        delete from proxy_whitelist_app.accounts where id in {smoke_accounts};
+        {restore}
     """)
 
 
-def expect(status, body, want_status, want_body=None, want_type=None):
+def expect(status: int, body: Any, want_status: int, want_body: Any = None,
+           want_type: type | tuple[type, ...] | None = None) -> None:
     assert status == want_status, f"HTTP {status}: {body!r}"
     if want_body is not None:
         assert body == want_body, f"expected {want_body!r}, got {body!r}"
     if want_type is not None:
-        assert isinstance(body, want_type), f"expected {want_type.__name__}, got {body!r}"
+        assert isinstance(body, want_type), f"expected {want_type}, got {body!r}"
 
 
-# (name, setup or None, method, path, body, check)
-CHECKS = [
+def contains(body: Any, row: Any) -> None:
+    assert isinstance(body, list), f"expected a list of rows, got {body!r}"
+    assert row in body, f"{row!r} not in {body!r}"
+
+
+def expect_contains(row: Any) -> Callable[[int, Any], None]:
+    def check(status: int, body: Any) -> None:
+        expect(status, body, 200)
+        contains(body, row)
+    return check
+
+
+def expect_lists_smoke_author(status: int, body: Any) -> None:
+    expect(status, body, 200)
+    assert SMOKE_ACCOUNT in json.dumps(body), f"{SMOKE_ACCOUNT} not in {body!r}"
+
+
+def expect_not_blacklisted(status: int, body: Any) -> None:
+    expect(status, body, 200, want_type=dict)
+    assert SMOKE_URL not in body["urls"], f"{SMOKE_URL} in {body!r}"
+
+
+def expect_blacklisted(status: int, body: Any) -> None:
+    expect(status, body, 200, want_type=dict)
+    contains(body["urls"], SMOKE_URL)
+
+
+def expect_smoke_account(status: int, body: Any) -> None:
+    expect(status, body, 200)
+    contains([{"hive_id": r["hive_id"], "name": r["name"]} for r in body],
+             {"hive_id": SMOKE_HIVE_ID, "name": SMOKE_ACCOUNT})
+
+
+def page_urls(base: str) -> tuple[int, Any]:
+    """Read PAGE_BLOCK of /stream/urls two rows at a time, resuming after each page's last row."""
+    rows, from_block, after = [], PAGE_BLOCK, ""
+    while True:
+        status, page = call(base, "GET", f"/rpc/stream_urls?from_block={from_block}&to_block={PAGE_BLOCK}&limit=2{after}")
+        if status != 200:
+            return status, page
+        assert len(page) <= 2, f"page of {len(page)} rows for limit=2"
+        rows += page
+        if len(page) < 2:
+            return status, rows
+        from_block, after = page[-1]["first_block"], f"&after_md5={page[-1]['md5']}"
+
+
+def expect_identity(status: int, body: Any) -> None:
+    expect(status, body, 200, want_type=dict)
+    uuid.UUID(body["sync_uuid"])
+    assert body["stream_schema_version"] == 1, f"stream_schema_version {body['stream_schema_version']!r}"
+    assert isinstance(body["stream_sentinel_block"], int), f"stream_sentinel_block {body['stream_sentinel_block']!r}"
+
+
+def expect_url(want: str | None) -> Callable[[int, Any], None]:
+    def check(status: int, body: Any) -> None:
+        expect(status, body, 200)
+        assert body == want, f"expected {want!r}, got {body!r}"
+        assert _last_headers.get("Cache-Control") == "public, max-age=60", f"Cache-Control {_last_headers.get('Cache-Control')!r}"
+    return check
+
+
+# (name, setup or None, method or page reader, path, body, check)
+CHECKS: list[tuple[str, Callable[[], None] | None, str | Callable[[str], tuple[int, Any]], str, Any,
+                   Callable[[int, Any], object]]] = [
     ("root spec", None, "GET", "/", None,
      lambda s, b: expect(s, b, 200, want_type=dict)),
     ("sync_status", None, "GET", "/rpc/sync_status", None,
@@ -119,11 +234,44 @@ CHECKS = [
      {"url": SMOKE_URL, "blacklisted_accounts": ["someone-else"]},
      lambda s, b: expect(s, b, 200, "whitelisted")),
     ("url_accounts lists the seeded author", None, "POST", "/rpc/url_accounts", {"url": SMOKE_URL},
-     lambda s, b: (expect(s, b, 200), (lambda: None if SMOKE_ACCOUNT in json.dumps(b) else (_ for _ in ()).throw(AssertionError(f"{SMOKE_ACCOUNT} not in {b!r}")))())),
+     expect_lists_smoke_author),
+    ("stream_blacklists does not list the url before blacklisting", None, "GET", "/rpc/stream_blacklists", None,
+     expect_not_blacklisted),
     ("check_url blacklisted after blacklisting the url", blacklist_url, "POST", "/rpc/check_url", {"url": SMOKE_URL},
      lambda s, b: expect(s, b, 200, "blacklisted")),
     ("is_whitelisted of an unseen url is false", None, "POST", "/rpc/is_whitelisted",
      {"url": SMOKE_URL + "?other"}, lambda s, b: expect(s, b, 200, False)),
+    ("stream_blacklists lists the blacklisted url", None, "GET", "/rpc/stream_blacklists", None,
+     expect_blacklisted),
+    ("sync_status reports the stream source identity", None, "GET", "/rpc/sync_status", None, expect_identity),
+    ("stream_urls returns the seeded url at its block", seed_streams, "GET",
+     f"/rpc/stream_urls?from_block={URL_BLOCK}&to_block={URL_BLOCK}", None,
+     expect_contains({"first_block": URL_BLOCK, "md5": md5(SMOKE_URL), "url": SMOKE_URL})),
+    ("stream_url_authors returns the seeded association", None, "GET",
+     f"/rpc/stream_url_authors?from_block={URL_BLOCK}&to_block={URL_BLOCK}", None,
+     expect_contains({"first_block": URL_BLOCK, "url_md5": md5(SMOKE_URL), "account_name": SMOKE_ACCOUNT})),
+    ("stream_profiles returns the seeded profile", None, "GET",
+     f"/rpc/stream_profiles?from_block={PROFILE_BLOCK}&to_block={PROFILE_BLOCK}", None,
+     lambda s, b: expect(s, b, 200, [{"updated_block": PROFILE_BLOCK, "account_name": SMOKE_ACCOUNT,
+                                     "avatar_url": AVATAR, "cover_url": COVER}])),
+    ("stream_accounts returns the seeded account with its hive_id", None, "GET", "/rpc/stream_accounts?after_id=0", None,
+     expect_smoke_account),
+    ("stream_urls pages of limit=2 cover the 5 urls of one block exactly once", None, page_urls, "/rpc/stream_urls", None,
+     lambda s, b: expect(s, sorted(r["md5"] for r in b), 200, sorted(md5(u) for u in PAGE_URLS))),
+    ("stream_urls rejects to_block below from_block", None, "GET", "/rpc/stream_urls?from_block=10&to_block=9", None,
+     lambda s, b: expect(s, b, 400)),
+    ("stream_profiles serves a changed avatar at its new block", change_avatar, "GET",
+     f"/rpc/stream_profiles?from_block={CHANGE_BLOCK}&to_block={CHANGE_BLOCK}", None,
+     lambda s, b: expect(s, b, 200, [{"updated_block": CHANGE_BLOCK, "account_name": SMOKE_ACCOUNT,
+                                     "avatar_url": AVATAR2, "cover_url": COVER}])),
+    ("avatar returns the changed url", None, "GET", f"/rpc/avatar?name={SMOKE_ACCOUNT}", None, expect_url(AVATAR2)),
+    ("cover returns the cover url", None, "GET", f"/rpc/cover?name={SMOKE_ACCOUNT}", None, expect_url(COVER)),
+    ("avatar of an account without one is null", None, "GET", f"/rpc/avatar?name={PLAIN_ACCOUNT}", None, expect_url(None)),
+    ("cover of an account without one is null", None, "GET", f"/rpc/cover?name={PLAIN_ACCOUNT}", None, expect_url(None)),
+    ("avatar of an unknown account is 404", None, "GET", f"/rpc/avatar?name={UNKNOWN_ACCOUNT}", None,
+     lambda s, b: expect(s, b, 404)),
+    ("cover of an unknown account is 404", None, "GET", f"/rpc/cover?name={UNKNOWN_ACCOUNT}", None,
+     lambda s, b: expect(s, b, 404)),
 ]
 
 
@@ -174,9 +322,9 @@ def main(out_dir: str) -> int:
             try:
                 if setup:
                     setup()
-                status, answer = call(base, method, path, body)
+                status, answer = method(base) if callable(method) else call(base, method, path, body)
                 check(status, answer)
-                print(f"ok   {name}: {method} {path} -> {status} {json.dumps(answer)[:120]}")
+                print(f"ok   {name}: {path} -> {status} {json.dumps(answer)[:120]}")
             except Exception as exc:  # noqa: BLE001 - every failure becomes a junit case
                 error = f"{type(exc).__name__}: {exc}"
                 print(f"FAIL {name}: {error}", file=sys.stderr)

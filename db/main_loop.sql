@@ -51,7 +51,7 @@ BEGIN
         -- Write to PostgreSQL
         IF array_length(__all_resolved, 1) > 0 THEN
             __total := __total + proxy_whitelist_app.whitelist_urls(
-                __all_resolved, __local_account_id
+                __all_resolved, __local_account_id, rec.block_num
             );
         END IF;
 
@@ -82,6 +82,9 @@ DECLARE
     __all_resolved TEXT[];
     __total INT := 0;
     __local_account_id INT;
+    -- Not tied to an operation: label new rows with the next block, so a
+    -- stream reader that is already at the current block still sees them.
+    __block INT := hive.app_get_current_block_num('proxy_whitelist_app') + 1;
 BEGIN
     FOR rec IN
         SELECT ha.id AS hive_account_id,
@@ -116,7 +119,7 @@ BEGIN
 
         IF array_length(__all_resolved, 1) > 0 THEN
             __total := __total + proxy_whitelist_app.whitelist_urls(
-                __all_resolved, __local_account_id
+                __all_resolved, __local_account_id, __block
             );
         END IF;
     END LOOP;
@@ -132,6 +135,8 @@ DROP FUNCTION IF EXISTS proxy_whitelist_app.process_profile_images();
 -- Incremental profile image processing: only process accounts that had
 -- account_update or account_update2 operations in the given block range.
 -- Uses hafd.operations directly (not operations_view) for performance.
+-- Whitelists the profile URLs and records the account's avatar/cover in
+-- account_profiles, both at the block of the account's last update in the range.
 CREATE OR REPLACE FUNCTION proxy_whitelist_app.process_profile_images_incremental(
     _first_block INT, _last_block INT
 )
@@ -149,14 +154,27 @@ DECLARE
     __local_account_id INT;
 BEGIN
     FOR __rec IN
-        SELECT DISTINCT ha.id AS hive_account_id,
-               ha.name, ha.posting_json_metadata, ha.json_metadata
-        FROM hafd.operations ho
+        SELECT ha.id AS hive_account_id,
+               ha.name, ha.posting_json_metadata, ha.json_metadata,
+               ops.block_num
+        FROM (
+            SELECT ho.body_value->>'account' AS account,
+                   max(hafd.operation_id_to_block_num(ho.id)) AS block_num
+            FROM hafd.operations ho
+            WHERE hafd.operation_id_to_block_num(ho.id) BETWEEN _first_block AND _last_block
+              AND ho.op_type_id IN (10, 43)
+            GROUP BY 1
+        ) ops
         JOIN hivemind_app.hive_accounts ha
-            ON ha.name = ho.body_value->>'account'
-        WHERE hafd.operation_id_to_block_num(ho.id) BETWEEN _first_block AND _last_block
-          AND ho.op_type_id IN (10, 43)
+            ON ha.name = ops.account
     LOOP
+        PERFORM proxy_whitelist_app.set_account_profile(
+            __rec.hive_account_id, __rec.name, img.avatar_url, img.cover_url, __rec.block_num
+        )
+        FROM proxy_whitelist_app.extract_profile_images(
+            __rec.posting_json_metadata, __rec.json_metadata
+        ) img;
+
         __urls := proxy_whitelist_app.extract_profile_urls(
             __rec.posting_json_metadata, __rec.json_metadata
         );
@@ -177,7 +195,7 @@ BEGIN
 
         IF array_length(__all_urls, 1) IS NOT NULL THEN
             __count := proxy_whitelist_app.whitelist_urls(
-                __all_urls, __local_account_id
+                __all_urls, __local_account_id, __rec.block_num
             );
             __total := __total + __count;
         END IF;
@@ -189,6 +207,61 @@ BEGIN
     END IF;
 
     RETURN __total;
+END;
+$$;
+
+-- One-time fill of account_profiles from hivemind's current account state,
+-- with the candidate filter of process_profile_images_full_scan(); rows are
+-- labelled with the stream sentinel block (app_status.stream_sentinel_block).
+-- Does nothing once app_status.account_profiles_backfilled is set, so
+-- install_app.sh can call it on every install. Returns the rows written.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.backfill_account_profiles()
+RETURNS INT
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    __sentinel INT;
+    __count INT;
+BEGIN
+    SELECT stream_sentinel_block INTO __sentinel
+    FROM proxy_whitelist_app.app_status
+    WHERE NOT account_profiles_backfilled;
+    IF NOT FOUND THEN
+        RETURN 0;
+    END IF;
+
+    -- Set-based (one statement) so the accounts that are new to this app get
+    -- their ids from the RETURNING of the same statement.
+    WITH kept AS (
+        SELECT ha.id AS hive_id, ha.name, img.avatar_url, img.cover_url
+        FROM hivemind_app.hive_accounts ha
+        CROSS JOIN LATERAL proxy_whitelist_app.extract_profile_images(
+            ha.posting_json_metadata, ha.json_metadata
+        ) img
+        WHERE (ha.posting_json_metadata ~ '"profile_image"'
+           OR ha.json_metadata ~ '"profile_image"'
+           OR ha.posting_json_metadata ~ '"cover_image"'
+           OR ha.json_metadata ~ '"cover_image"')
+          AND (img.avatar_url IS NOT NULL OR img.cover_url IS NOT NULL)
+    ),
+    new_accounts AS (
+        INSERT INTO proxy_whitelist_app.accounts (hive_id, name)
+        SELECT hive_id, name FROM kept
+        ON CONFLICT (hive_id) DO NOTHING
+        RETURNING id, hive_id
+    )
+    INSERT INTO proxy_whitelist_app.account_profiles (account_id, avatar_url, cover_url, updated_block)
+    SELECT COALESCE(a.id, n.id), k.avatar_url, k.cover_url, __sentinel
+    FROM kept k
+    LEFT JOIN proxy_whitelist_app.accounts a ON a.hive_id = k.hive_id
+    LEFT JOIN new_accounts n ON n.hive_id = k.hive_id
+    ON CONFLICT (account_id) DO NOTHING;
+    GET DIAGNOSTICS __count = ROW_COUNT;
+
+    UPDATE proxy_whitelist_app.app_status SET account_profiles_backfilled = TRUE;
+    RAISE NOTICE 'account_profiles: backfilled % accounts at block %', __count, __sentinel;
+    RETURN __count;
 END;
 $$;
 
@@ -233,6 +306,9 @@ $$;
 -- hours and be interrupted/resumed by block number. Safe to run alongside live
 -- block processing: it only does ON CONFLICT DO NOTHING inserts and idempotent
 -- upserts. _to_block defaults to the app's current block.
+-- Rows it adds carry the block of their post, which may be older than what a
+-- stream reader (endpoints/stream.sql) has already consumed: such a reader
+-- picks them up only by re-reading the stream from that block.
 --
 --   CALL proxy_whitelist_app.backfill_posts(<first block>);
 --   CALL proxy_whitelist_app.backfill_posts_since('3 months');

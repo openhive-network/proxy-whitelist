@@ -2,7 +2,10 @@ SET ROLE proxy_whitelist_owner;
 
 /*
  * sync_status() — the last processed block as {last_block_num, last_block_time},
- * for GET /sync-status (the HAF-wide uniform health/freshness API). The
+ * for GET /sync-status (the HAF-wide uniform health/freshness API), plus the
+ * stream source identity (endpoints/stream.sql): sync_uuid, minted on the
+ * first install and kept by reinstalls, stream_schema_version and
+ * stream_sentinel_block, the block rows predating the streams carry. The
  * timestamp lets consumers compute staleness with a single call
  * (age = now() - last_block_time) instead of needing a second head-block
  * reference.
@@ -43,10 +46,14 @@ BEGIN
       RETURN (
         SELECT json_build_object(
           'last_block_num', c.current_block_num,
-          'last_block_time', to_char(b.created_at, 'YYYY-MM-DD"T"HH24:MI:SS')
+          'last_block_time', to_char(b.created_at, 'YYYY-MM-DD"T"HH24:MI:SS'),
+          'sync_uuid', s.sync_uuid,
+          'stream_schema_version', s.stream_schema_version,
+          'stream_sentinel_block', s.stream_sentinel_block
         )
         FROM hafd.contexts c
         LEFT JOIN hafd.blocks b ON b.num = c.current_block_num
+        CROSS JOIN proxy_whitelist_app.app_status s
         WHERE c.name = '%s'
       );
     END
