@@ -1,6 +1,7 @@
 -- The replication streams (endpoints/stream.sql), the block-labelled writers
--- that feed them (whitelist_urls, set_account_profile) and the avatar/cover
--- lookup. Run against an installed app by .aidev/run-checks.sh's install
+-- that feed them (ensure_account, whitelist_urls, set_account_profile), the
+-- stream source identity on a context rewind (check_stream_rewind) and the
+-- avatar/cover lookup. Run against an installed app by .aidev/run-checks.sh's install
 -- step; any failed case raises. Everything it writes is rolled back.
 BEGIN;
 SET ROLE proxy_whitelist_owner;
@@ -10,6 +11,9 @@ DECLARE
     __s CONSTANT INT := (SELECT stream_sentinel_block FROM proxy_whitelist_app.app_status);
     __b CONSTANT INT := __s + 10;
     __head CONSTANT INT := __s + 100;
+    -- Five accounts introduced in one block, their profiles in the next.
+    __a CONSTANT INT := __s + 40;
+    __five CONSTANT TEXT[] := ARRAY['stream-p1', 'stream-p2', 'stream-p3', 'stream-p4', 'stream-p5'];
     __case RECORD;
     __img RECORD;
     __alice INT;
@@ -22,6 +26,12 @@ DECLARE
     __after_md5 TEXT;
     __after_account TEXT;
     __count INT;
+    __sizes INT[];
+    __heads INT[];
+    __to_block INT;
+    __md5_scans BIGINT;
+    __uuid UUID;
+    __reminted BOOLEAN;
     __profile proxy_whitelist_app.account_profiles;
 BEGIN
     PERFORM hive.app_set_current_block_num('proxy_whitelist_app', __head);
@@ -52,9 +62,13 @@ BEGIN
         END IF;
     END LOOP;
 
-    __alice := proxy_whitelist_app.ensure_account(2147000201, 'stream-alice');
-    __bob := proxy_whitelist_app.ensure_account(2147000202, 'stream-bob');
-    __carol := proxy_whitelist_app.ensure_account(2147000203, 'stream-carol');
+    __alice := proxy_whitelist_app.ensure_account(2147000201, 'stream-alice', __b);
+    __bob := proxy_whitelist_app.ensure_account(2147000202, 'stream-bob', __b);
+    __carol := proxy_whitelist_app.ensure_account(2147000203, 'stream-carol', __b);
+    IF proxy_whitelist_app.ensure_account(2147000201, 'stream-alice', __b + 1) != __alice
+       OR (SELECT first_block FROM proxy_whitelist_app.accounts WHERE id = __alice) != __b THEN
+        RAISE EXCEPTION 'ensure_account: a known account changed its id or lost its first_block';
+    END IF;
 
     -- whitelist_urls labels new rows with its block; existing rows keep theirs.
     PERFORM proxy_whitelist_app.whitelist_urls(
@@ -70,19 +84,26 @@ BEGIN
         RAISE EXCEPTION 'whitelist_urls: a new author association does not carry its own block';
     END IF;
 
-    -- stream_urls: pages of 2 over the 5 URLs of block __b cover each exactly once.
+    -- stream_urls: pages of 2 over [__b, __b + 3], whose rows are the 5 URLs
+    -- of block __b, are 2, 2 and 1 rows; a full page's Stream-To-Block is its
+    -- last row's block, the short one's the applied upper bound, and
+    -- following (Stream-To-Block, last md5) covers each URL exactly once.
     __got := '{}';
+    __sizes := '{}';
+    __heads := '{}';
     __from := __b;
     __after_md5 := NULL;
     LOOP
         __page := ARRAY(
             SELECT p.first_block || '|' || p.md5
-            FROM proxy_whitelist_endpoints.stream_urls(__from, __b, __after_md5) p
-            LIMIT 2
+            FROM proxy_whitelist_endpoints.stream_urls(__from, __b + 3, __after_md5, 2) p
         );
+        __to_block := (current_setting('response.headers')::JSON -> 0 ->> 'Stream-To-Block')::INT;
         __got := __got || __page;
+        __sizes := __sizes || cardinality(__page);
+        __heads := __heads || __to_block;
         EXIT WHEN cardinality(__page) < 2;
-        __from := split_part(__page[2], '|', 1)::INT;
+        __from := __to_block;
         __after_md5 := split_part(__page[2], '|', 2);
     END LOOP;
     __want := ARRAY(
@@ -93,6 +114,61 @@ BEGIN
     IF __got IS DISTINCT FROM __want THEN
         RAISE EXCEPTION 'stream_urls paging: expected %, got %', __want, __got;
     END IF;
+    IF (__sizes, __heads) IS DISTINCT FROM (ARRAY[2, 2, 1], ARRAY[__b, __b, __b + 3]) THEN
+        RAISE EXCEPTION 'stream_urls pages: expected sizes (2, 2, 1) and Stream-To-Block (%, %, %), got % and %',
+            __b, __b, __b + 3, __sizes, __heads;
+    END IF;
+
+    -- url_authors: the 5 rows of block __b in pages of 2, as for urls.
+    __sizes := '{}';
+    __heads := '{}';
+    __from := __b;
+    __after_md5 := NULL;
+    __after_account := NULL;
+    LOOP
+        __page := ARRAY(
+            SELECT p.first_block || '|' || p.url_md5 || '|' || p.account_name
+            FROM proxy_whitelist_endpoints.stream_url_authors(__from, __b + 3, __after_md5, __after_account, 2) p
+        );
+        __to_block := (current_setting('response.headers')::JSON -> 0 ->> 'Stream-To-Block')::INT;
+        __sizes := __sizes || cardinality(__page);
+        __heads := __heads || __to_block;
+        EXIT WHEN cardinality(__page) < 2;
+        __from := __to_block;
+        __after_md5 := split_part(__page[2], '|', 2);
+        __after_account := split_part(__page[2], '|', 3);
+    END LOOP;
+    IF (__sizes, __heads) IS DISTINCT FROM (ARRAY[2, 2, 1], ARRAY[__b, __b, __b + 3]) THEN
+        RAISE EXCEPTION 'stream_url_authors pages: expected sizes (2, 2, 1) and Stream-To-Block (%, %, %), got % and %',
+            __b, __b, __b + 3, __sizes, __heads;
+    END IF;
+
+    -- A sentinel block no url_authors row carries is not read by md5: a page
+    -- over it does not touch urls_url_md5_idx and still returns the rows
+    -- around it.
+    UPDATE proxy_whitelist_app.app_status SET stream_sentinel_block = __b + 2;
+    __md5_scans := pg_stat_get_xact_numscans('proxy_whitelist_app.urls_url_md5_idx'::REGCLASS);
+    __got := ARRAY(
+        SELECT p.first_block || '|' || p.account_name
+        FROM proxy_whitelist_endpoints.stream_url_authors(__b, __b + 5) p
+    );
+    IF pg_stat_get_xact_numscans('proxy_whitelist_app.urls_url_md5_idx'::REGCLASS) != __md5_scans THEN
+        RAISE EXCEPTION 'stream_url_authors read urls by md5 for a sentinel block without rows';
+    END IF;
+    __want := ARRAY[__b || '|stream-alice', __b || '|stream-alice', __b || '|stream-alice',
+                    __b || '|stream-alice', __b || '|stream-alice', (__b + 5) || '|stream-bob'];
+    IF __got IS DISTINCT FROM __want THEN
+        RAISE EXCEPTION 'stream_url_authors around an empty sentinel block: expected %, got %', __want, __got;
+    END IF;
+    UPDATE proxy_whitelist_app.app_status SET stream_sentinel_block = __s;
+
+    -- The url_authors tiebreak is given whole or not at all.
+    BEGIN
+        PERFORM proxy_whitelist_endpoints.stream_url_authors(__b, __b, md5('https://stream.invalid/1.png'));
+        RAISE EXCEPTION 'stream_url_authors with after_md5 but no after_account did not raise';
+    EXCEPTION WHEN invalid_parameter_value THEN
+        NULL;
+    END;
 
     -- url_authors at the sentinel block are read by md5, the rest sorted;
     -- paging across both must still cover every row once, in stream order.
@@ -122,12 +198,11 @@ BEGIN
     LOOP
         __page := ARRAY(
             SELECT p.first_block || '|' || p.url_md5 || '|' || p.account_name
-            FROM proxy_whitelist_endpoints.stream_url_authors(__from, __b + 5, __after_md5, __after_account) p
-            LIMIT 2
+            FROM proxy_whitelist_endpoints.stream_url_authors(__from, __b + 5, __after_md5, __after_account, 2) p
         );
         __got := __got || __page;
         EXIT WHEN cardinality(__page) < 2;
-        __from := split_part(__page[2], '|', 1)::INT;
+        __from := (current_setting('response.headers')::JSON -> 0 ->> 'Stream-To-Block')::INT;
         __after_md5 := split_part(__page[2], '|', 2);
         __after_account := split_part(__page[2], '|', 3);
     END LOOP;
@@ -199,7 +274,81 @@ BEGIN
         NULL;
     END;
 
-    -- Range validation.
+    -- stream_accounts pages accounts by (first_block, name), not by id: an
+    -- account whose id is lower than those already streamed (as when a side
+    -- session's insert commits late) is still delivered at its block.
+    FOR __count IN 1..4 LOOP
+        PERFORM proxy_whitelist_app.ensure_account(2147000210 + __count, __five[__count], __a);
+    END LOOP;
+    INSERT INTO proxy_whitelist_app.accounts (id, hive_id, name, first_block)
+    VALUES (-2147000215, 2147000215, __five[5], __a);
+    __got := '{}';
+    __sizes := '{}';
+    __heads := '{}';
+    __from := __a;
+    __after_account := NULL;
+    LOOP
+        __page := ARRAY(
+            SELECT p.first_block || '|' || p.name
+            FROM proxy_whitelist_endpoints.stream_accounts(__from, __a + 2, __after_account, 2) p
+        );
+        __to_block := (current_setting('response.headers')::JSON -> 0 ->> 'Stream-To-Block')::INT;
+        __got := __got || __page;
+        __sizes := __sizes || cardinality(__page);
+        __heads := __heads || __to_block;
+        EXIT WHEN cardinality(__page) < 2;
+        __from := __to_block;
+        __after_account := split_part(__page[2], '|', 2);
+    END LOOP;
+    __want := ARRAY(SELECT __a || '|' || n FROM unnest(__five) n ORDER BY n COLLATE "C");
+    IF __got IS DISTINCT FROM __want THEN
+        RAISE EXCEPTION 'stream_accounts paging: expected %, got %', __want, __got;
+    END IF;
+    IF (__sizes, __heads) IS DISTINCT FROM (ARRAY[2, 2, 1], ARRAY[__a, __a, __a + 2]) THEN
+        RAISE EXCEPTION 'stream_accounts pages: expected sizes (2, 2, 1) and Stream-To-Block (%, %, %), got % and %',
+            __a, __a, __a + 2, __sizes, __heads;
+    END IF;
+
+    -- stream_profiles: the 5 profiles of block __a + 1 in pages of 2.
+    FOR __count IN 1..5 LOOP
+        PERFORM proxy_whitelist_app.set_account_profile(
+            2147000210 + __count, __five[__count], format('https://p/%s.png', __count), NULL, __a + 1
+        );
+    END LOOP;
+    __got := '{}';
+    __sizes := '{}';
+    __heads := '{}';
+    __from := __a + 1;
+    __after_account := NULL;
+    LOOP
+        __page := ARRAY(
+            SELECT p.updated_block || '|' || p.account_name
+            FROM proxy_whitelist_endpoints.stream_profiles(__from, __a + 3, __after_account, 2) p
+        );
+        __to_block := (current_setting('response.headers')::JSON -> 0 ->> 'Stream-To-Block')::INT;
+        __got := __got || __page;
+        __sizes := __sizes || cardinality(__page);
+        __heads := __heads || __to_block;
+        EXIT WHEN cardinality(__page) < 2;
+        __from := __to_block;
+        __after_account := split_part(__page[2], '|', 2);
+    END LOOP;
+    __want := ARRAY(SELECT (__a + 1) || '|' || n FROM unnest(__five) n ORDER BY n COLLATE "C");
+    IF __got IS DISTINCT FROM __want THEN
+        RAISE EXCEPTION 'stream_profiles paging: expected %, got %', __want, __got;
+    END IF;
+    IF (__sizes, __heads) IS DISTINCT FROM (ARRAY[2, 2, 1], ARRAY[__a + 1, __a + 1, __a + 3]) THEN
+        RAISE EXCEPTION 'stream_profiles pages: expected sizes (2, 2, 1) and Stream-To-Block (%, %, %), got % and %',
+            __a + 1, __a + 1, __a + 3, __sizes, __heads;
+    END IF;
+
+    -- Range and page size validation.
+    BEGIN
+        PERFORM proxy_whitelist_endpoints.stream_urls(__b, __b, NULL, 0);
+        RAISE EXCEPTION 'stream_urls with page_size 0 did not raise';
+    EXCEPTION WHEN invalid_parameter_value THEN
+        NULL;
+    END;
     FOR __case IN
         SELECT * FROM (VALUES (-1, NULL::INT), (10, 9)) AS c (from_block, to_block)
     LOOP
@@ -215,6 +364,32 @@ BEGIN
     SELECT proxy_whitelist_app.backfill_account_profiles() INTO __count;
     IF __count != 0 OR NOT (SELECT account_profiles_backfilled FROM proxy_whitelist_app.app_status) THEN
         RAISE EXCEPTION 'backfill_account_profiles: not a no-op after install (wrote % rows)', __count;
+    END IF;
+
+    -- check_stream_rewind: a restart at or past the recorded stream head keeps
+    -- sync_uuid; the context moved back below it re-mints it once. (The check
+    -- is a statement of its own: a query reads app_status with the snapshot
+    -- it started with.)
+    UPDATE proxy_whitelist_app.app_status SET stream_head_block = __head;
+    __uuid := (SELECT sync_uuid FROM proxy_whitelist_app.app_status);
+    __reminted := proxy_whitelist_app.check_stream_rewind(hive.app_get_current_block_num('proxy_whitelist_app'));
+    IF __reminted OR (SELECT sync_uuid FROM proxy_whitelist_app.app_status) != __uuid THEN
+        RAISE EXCEPTION 'check_stream_rewind: re-minted sync_uuid on a normal restart';
+    END IF;
+    PERFORM hive.app_set_current_block_num('proxy_whitelist_app', __head - 50);
+    __reminted := proxy_whitelist_app.check_stream_rewind(hive.app_get_current_block_num('proxy_whitelist_app'));
+    IF NOT __reminted
+       OR (SELECT sync_uuid FROM proxy_whitelist_app.app_status) = __uuid
+       OR (SELECT stream_head_block FROM proxy_whitelist_app.app_status) != __head - 50 THEN
+        RAISE EXCEPTION 'check_stream_rewind: the context moved back below the stream head kept sync_uuid';
+    END IF;
+    IF proxy_whitelist_endpoints.sync_status() ->> 'sync_uuid' = __uuid::TEXT
+       OR (proxy_whitelist_endpoints.sync_status() ->> 'stream_schema_version')::INT != 2 THEN
+        RAISE EXCEPTION 'sync_status: % after a rewind', proxy_whitelist_endpoints.sync_status();
+    END IF;
+    __uuid := (SELECT sync_uuid FROM proxy_whitelist_app.app_status);
+    IF proxy_whitelist_app.check_stream_rewind(hive.app_get_current_block_num('proxy_whitelist_app')) THEN
+        RAISE EXCEPTION 'check_stream_rewind: re-minted twice for one rewind';
     END IF;
 
     RAISE NOTICE 'streams: all cases pass';

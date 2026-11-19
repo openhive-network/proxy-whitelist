@@ -4,7 +4,8 @@ SET ROLE proxy_whitelist_owner;
  * sync_status() — the last processed block as {last_block_num, last_block_time},
  * for GET /sync-status (the HAF-wide uniform health/freshness API), plus the
  * stream source identity (endpoints/stream.sql): sync_uuid, minted on the
- * first install and kept by reinstalls, stream_schema_version and
+ * first install, kept by reinstalls and re-minted when the context is moved
+ * back below the stream head (check_stream_rewind), stream_schema_version and
  * stream_sentinel_block, the block rows predating the streams carry. The
  * timestamp lets consumers compute staleness with a single call
  * (age = now() - last_block_time) instead of needing a second head-block

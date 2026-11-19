@@ -3,15 +3,19 @@ SET ROLE proxy_whitelist_owner;
 -- Ensure an account exists in the local accounts table.
 -- Called during processing as authors are encountered.
 -- Returns the local proxy_whitelist_app.accounts.id.
+-- _block is the block that introduces the account to this app; an account
+-- that already exists keeps the block it was first seen at.
+DROP FUNCTION IF EXISTS proxy_whitelist_app.ensure_account(INT, VARCHAR);
 CREATE OR REPLACE FUNCTION proxy_whitelist_app.ensure_account(
     _hive_id INT,
-    _name VARCHAR(16)
+    _name VARCHAR(16),
+    _block INT
 )
 RETURNS INT
 LANGUAGE sql
 AS $$
-    INSERT INTO proxy_whitelist_app.accounts (hive_id, name)
-    VALUES (_hive_id, _name)
+    INSERT INTO proxy_whitelist_app.accounts (hive_id, name, first_block)
+    VALUES (_hive_id, _name, _block)
     ON CONFLICT (hive_id) DO UPDATE SET name = EXCLUDED.name
     RETURNING id;
 $$;
@@ -85,7 +89,7 @@ BEGIN
     END IF;
 
     INSERT INTO proxy_whitelist_app.account_profiles (account_id, avatar_url, cover_url, updated_block)
-    VALUES (proxy_whitelist_app.ensure_account(_hive_id, _name), _avatar_url, _cover_url, _block)
+    VALUES (proxy_whitelist_app.ensure_account(_hive_id, _name, _block), _avatar_url, _cover_url, _block)
     ON CONFLICT (account_id) DO UPDATE
         SET avatar_url = EXCLUDED.avatar_url,
             cover_url = EXCLUDED.cover_url,
@@ -95,9 +99,9 @@ BEGIN
 END;
 $$;
 
-GRANT EXECUTE ON FUNCTION proxy_whitelist_app.ensure_account(INT, VARCHAR)
+GRANT EXECUTE ON FUNCTION proxy_whitelist_app.ensure_account(INT, VARCHAR, INT)
     TO haf_admin WITH GRANT OPTION;
-GRANT EXECUTE ON FUNCTION proxy_whitelist_app.ensure_account(INT, VARCHAR)
+GRANT EXECUTE ON FUNCTION proxy_whitelist_app.ensure_account(INT, VARCHAR, INT)
     TO proxy_whitelist_user;
 
 GRANT EXECUTE ON FUNCTION proxy_whitelist_app.whitelist_urls(TEXT[], INT, INT)

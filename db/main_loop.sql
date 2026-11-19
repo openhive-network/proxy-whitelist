@@ -34,7 +34,7 @@ BEGIN
         WHERE hp.counter_deleted = 0
     LOOP
         -- Ensure author exists in local accounts table
-        __local_account_id := proxy_whitelist_app.ensure_account(rec.hive_account_id, rec.author);
+        __local_account_id := proxy_whitelist_app.ensure_account(rec.hive_account_id, rec.author, rec.block_num);
 
         -- Extract raw image URLs from body + json_metadata
         __urls := proxy_whitelist_app.extract_image_urls(rec.body, rec.json);
@@ -106,7 +106,7 @@ BEGIN
         END IF;
 
         -- Ensure author exists in local accounts table
-        __local_account_id := proxy_whitelist_app.ensure_account(rec.hive_account_id, rec.name);
+        __local_account_id := proxy_whitelist_app.ensure_account(rec.hive_account_id, rec.name, __block);
 
         -- Resolve each profile URL
         __all_resolved := ARRAY[]::TEXT[];
@@ -183,7 +183,7 @@ BEGIN
         END IF;
 
         -- Ensure author exists in local accounts table
-        __local_account_id := proxy_whitelist_app.ensure_account(__rec.hive_account_id, __rec.name);
+        __local_account_id := proxy_whitelist_app.ensure_account(__rec.hive_account_id, __rec.name, __rec.block_num);
 
         __all_urls := '{}';
         FOR i IN 1..array_length(__urls, 1) LOOP
@@ -246,8 +246,8 @@ BEGIN
           AND (img.avatar_url IS NOT NULL OR img.cover_url IS NOT NULL)
     ),
     new_accounts AS (
-        INSERT INTO proxy_whitelist_app.accounts (hive_id, name)
-        SELECT hive_id, name FROM kept
+        INSERT INTO proxy_whitelist_app.accounts (hive_id, name, first_block)
+        SELECT hive_id, name, __sentinel FROM kept
         ON CONFLICT (hive_id) DO NOTHING
         RETURNING id, hive_id
     )
@@ -426,6 +426,49 @@ BEGIN
 END
 $$;
 
+-- Stream source identity (endpoints/stream.sql): when the context is behind
+-- app_status.stream_head_block, the blocks above _context_block are about to
+-- be processed again (a HAF replay that kept the app schema, or an operator
+-- moving the context back with hive.app_set_current_block_num), which
+-- re-derives first_block labels and ids a replica has already copied. Mints a
+-- new sync_uuid so that replicas re-bootstrap, and moves stream_head_block
+-- down to _context_block so that the check fires once per rewind. The
+-- sentinel block is kept: rows labelled with it are still there. Records
+-- _context_block as the head when none is recorded yet. Returns whether
+-- sync_uuid was re-minted.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.check_stream_rewind(_context_block INT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    __head INT;
+    __old_uuid UUID;
+    __new_uuid UUID;
+BEGIN
+    SELECT stream_head_block, sync_uuid INTO __head, __old_uuid
+    FROM proxy_whitelist_app.app_status
+    FOR UPDATE;
+
+    IF __head IS NOT NULL AND _context_block >= __head THEN
+        RETURN FALSE;
+    END IF;
+
+    IF __head IS NULL THEN
+        UPDATE proxy_whitelist_app.app_status SET stream_head_block = _context_block;
+        RETURN FALSE;
+    END IF;
+
+    __new_uuid := gen_random_uuid();
+    UPDATE proxy_whitelist_app.app_status
+       SET sync_uuid = __new_uuid,
+           stream_head_block = _context_block;
+    RAISE WARNING 'proxy_whitelist: the context is at block %, behind the stream head %: sync_uuid % re-minted as %',
+                  _context_block, __head, __old_uuid, __new_uuid;
+    RETURN TRUE;
+END;
+$$;
+
 CREATE OR REPLACE PROCEDURE proxy_whitelist_app.process_blocks(
     _context_name hive.CONTEXT_NAME,
     _block_range hive.BLOCKS_RANGE,
@@ -436,6 +479,11 @@ CREATE OR REPLACE PROCEDURE proxy_whitelist_app.process_blocks(
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    -- Committed with the range: the streams serve up to the context's block,
+    -- which moves in the same transaction.
+    PERFORM proxy_whitelist_app.check_stream_rewind(_block_range.first_block - 1);
+    UPDATE proxy_whitelist_app.app_status SET stream_head_block = _block_range.last_block;
+
     IF hive.get_current_stage_name(_context_name) = 'MASSIVE_PROCESSING' THEN
         CALL proxy_whitelist_app.massive_processing(
             _block_range.first_block, _block_range.last_block, _logs, _worker, _done
@@ -591,6 +639,8 @@ BEGIN
     FROM proxy_whitelist_app.app_status;
 
     PERFORM proxy_whitelist_app.allowProcessing();
+    PERFORM proxy_whitelist_app.check_stream_rewind(hive.app_get_current_block_num(__context_name));
+    COMMIT;
 
     RAISE NOTICE 'Last block processed by %: %',
                  __context_name,

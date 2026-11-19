@@ -46,6 +46,16 @@ BEGIN
     ADD COLUMN IF NOT EXISTS stream_sentinel_block INT;
   ALTER TABLE proxy_whitelist_app.app_status
     ADD COLUMN IF NOT EXISTS account_profiles_backfilled BOOLEAN NOT NULL DEFAULT FALSE;
+  -- The last block whose rows the streams may have served (the end of the
+  -- last processed range); the context falling behind it means the blocks
+  -- above are re-derived, see check_stream_rewind().
+  ALTER TABLE proxy_whitelist_app.app_status
+    ADD COLUMN IF NOT EXISTS stream_head_block INT;
+  -- The version of the /stream/* contract this code serves (endpoints/stream.sql).
+  ALTER TABLE proxy_whitelist_app.app_status
+    ALTER COLUMN stream_schema_version SET DEFAULT 2;
+  UPDATE proxy_whitelist_app.app_status SET stream_schema_version = 2
+  WHERE stream_schema_version IS DISTINCT FROM 2;
 
   IF NOT hive.app_context_exists(__schema_name) THEN
     PERFORM hive.app_create_context(
@@ -135,8 +145,8 @@ ON CONFLICT (id) DO NOTHING;
 -- once: the sentinel is recorded on the first install that has these columns,
 -- and the columns are added only when missing. Adding a NOT NULL column with a
 -- constant default is a catalog-only change in PostgreSQL 11+, so the existing
--- rows of urls/url_authors are not rewritten; the default is then dropped so
--- that every insert site has to supply the block.
+-- rows of urls/url_authors/accounts are not rewritten; the default is then
+-- dropped so that every insert site has to supply the block.
 DO $BODY$
 DECLARE
   __schema_name VARCHAR;
@@ -152,7 +162,7 @@ BEGIN
     RAISE NOTICE 'Stream sentinel block: %', __sentinel;
   END IF;
 
-  FOREACH __table IN ARRAY ARRAY['urls', 'url_authors'] LOOP
+  FOREACH __table IN ARRAY ARRAY['urls', 'url_authors', 'accounts'] LOOP
     IF NOT EXISTS (
       SELECT 1 FROM information_schema.columns
       WHERE table_schema = 'proxy_whitelist_app' AND table_name = __table AND column_name = 'first_block'
@@ -168,6 +178,8 @@ CREATE INDEX IF NOT EXISTS urls_by_first_block
 ON proxy_whitelist_app.urls (first_block, md5(url));
 CREATE INDEX IF NOT EXISTS url_authors_by_first_block
 ON proxy_whitelist_app.url_authors (first_block, url_id);
+CREATE INDEX IF NOT EXISTS accounts_by_first_block
+ON proxy_whitelist_app.accounts (first_block, name COLLATE "C");
 
 -- Current avatar/cover per account (no history), from the latest
 -- account_update/account_update2 seen for it.

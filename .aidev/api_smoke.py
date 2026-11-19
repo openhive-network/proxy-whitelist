@@ -12,8 +12,9 @@ PROXY_WHITELIST_TEST_ADMIN_URL, and makes the calls of CHECKS in order:
   root spec, sync_status, check_url unknown → (seeded) whitelisted →
   (seeded author blacklisted by the caller) unknown → (url blacklisted) blacklisted,
   url_accounts of the seeded URL, then the /stream/* pages (seeded at fixed
-  blocks, with the app's processed block moved past them), a profile change,
-  and avatar/cover.
+  blocks, with the app's processed block moved past them; paged with
+  page_size=2 by following Stream-To-Block), a profile change, and
+  avatar/cover.
 
 Writes OUT_DIR/api-smoke.xml (one junit case per call) and exits non-zero when any
 call fails. The seeded rows are removed and the app's block restored at the end.
@@ -26,6 +27,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from typing import Any, Callable
@@ -47,6 +49,7 @@ AVATAR, AVATAR2, COVER = (f"{SMOKE_PREFIX}-{n}.png" for n in ("avatar", "avatar2
 # processed, so seeding moves the app's block to STREAM_HEAD (restored by cleanup).
 URL_BLOCK, PAGE_BLOCK, PROFILE_BLOCK, CHANGE_BLOCK, STREAM_HEAD = (
     900_000_010, 900_000_015, 900_000_020, 900_000_030, 900_000_100)
+PAGE_TO = PAGE_BLOCK + 3
 _original_head = None
 _last_headers: dict[str, str] = {}
 
@@ -94,7 +97,7 @@ def seed_url() -> None:
         select hive.app_set_current_block_num('proxy_whitelist_app', {STREAM_HEAD});
         select proxy_whitelist_app.whitelist_urls(
             array['{SMOKE_URL}'],
-            proxy_whitelist_app.ensure_account({SMOKE_HIVE_ID}, '{SMOKE_ACCOUNT}'),
+            proxy_whitelist_app.ensure_account({SMOKE_HIVE_ID}, '{SMOKE_ACCOUNT}', {URL_BLOCK}),
             {URL_BLOCK});
     """)
 
@@ -105,11 +108,11 @@ def seed_streams() -> None:
     psql(f"""
         set role proxy_whitelist_owner;
         select proxy_whitelist_app.whitelist_urls(
-            array[{page_urls}], proxy_whitelist_app.ensure_account({SMOKE_HIVE_ID}, '{SMOKE_ACCOUNT}'), {PAGE_BLOCK});
+            array[{page_urls}], proxy_whitelist_app.ensure_account({SMOKE_HIVE_ID}, '{SMOKE_ACCOUNT}', {PAGE_BLOCK}), {PAGE_BLOCK});
         select proxy_whitelist_app.set_account_profile(
             {SMOKE_HIVE_ID}, '{SMOKE_ACCOUNT}', img.avatar_url, img.cover_url, {PROFILE_BLOCK})
         from proxy_whitelist_app.extract_profile_images(NULL, '{metadata}') img;
-        select proxy_whitelist_app.ensure_account({PLAIN_HIVE_ID}, '{PLAIN_ACCOUNT}');
+        select proxy_whitelist_app.ensure_account({PLAIN_HIVE_ID}, '{PLAIN_ACCOUNT}', {PAGE_BLOCK});
     """)
 
 
@@ -181,30 +184,40 @@ def expect_blacklisted(status: int, body: Any) -> None:
     contains(body["urls"], SMOKE_URL)
 
 
-def expect_smoke_account(status: int, body: Any) -> None:
-    expect(status, body, 200)
-    contains([{"hive_id": r["hive_id"], "name": r["name"]} for r in body],
-             {"hive_id": SMOKE_HIVE_ID, "name": SMOKE_ACCOUNT})
+def header(name: str) -> str | None:
+    return next((v for k, v in _last_headers.items() if k.lower() == name.lower()), None)
 
 
-def page_urls(base: str) -> tuple[int, Any]:
-    """Read PAGE_BLOCK of /stream/urls two rows at a time, resuming after each page's last row."""
-    rows, from_block, after = [], PAGE_BLOCK, ""
-    while True:
-        status, page = call(base, "GET", f"/rpc/stream_urls?from_block={from_block}&to_block={PAGE_BLOCK}&limit=2{after}")
-        if status != 200:
-            return status, page
-        assert len(page) <= 2, f"page of {len(page)} rows for limit=2"
-        rows += page
-        if len(page) < 2:
-            return status, rows
-        from_block, after = page[-1]["first_block"], f"&after_md5={page[-1]['md5']}"
+def pager(path: str, block_field: str, cursor: dict[str, str]) -> Callable[[str], tuple[int, Any]]:
+    """A reader of the 5 rows of PAGE_BLOCK from a stream over [PAGE_BLOCK, PAGE_TO], with page_size=2.
+
+    Each page continues from (Stream-To-Block, the last row's cursor fields). The pages
+    must hold 2, 2 and 1 rows, a full page's Stream-To-Block being its last row's
+    block and the short one's the applied upper bound PAGE_TO.
+    """
+    def read(base: str) -> tuple[int, Any]:
+        rows, sizes, from_block, after = [], [], PAGE_BLOCK, ""
+        while True:
+            status, page = call(base, "GET", f"{path}?from_block={from_block}&to_block={PAGE_TO}&page_size=2{after}")
+            if status != 200:
+                return status, page
+            to_block = int(header("Stream-To-Block") or -1)
+            want = page[-1][block_field] if len(page) == 2 else PAGE_TO
+            assert to_block == want, f"Stream-To-Block {to_block} for a page of {len(page)}, expected {want}"
+            rows += page
+            sizes.append(len(page))
+            if len(page) < 2:
+                assert sizes == [2, 2, 1], f"page sizes {sizes}"
+                return status, rows
+            from_block = to_block
+            after = "".join(f"&{param}={urllib.parse.quote(str(page[-1][field]))}" for param, field in cursor.items())
+    return read
 
 
 def expect_identity(status: int, body: Any) -> None:
     expect(status, body, 200, want_type=dict)
     uuid.UUID(body["sync_uuid"])
-    assert body["stream_schema_version"] == 1, f"stream_schema_version {body['stream_schema_version']!r}"
+    assert body["stream_schema_version"] == 2, f"stream_schema_version {body['stream_schema_version']!r}"
     assert isinstance(body["stream_sentinel_block"], int), f"stream_sentinel_block {body['stream_sentinel_block']!r}"
 
 
@@ -254,10 +267,19 @@ CHECKS: list[tuple[str, Callable[[], None] | None, str | Callable[[str], tuple[i
      f"/rpc/stream_profiles?from_block={PROFILE_BLOCK}&to_block={PROFILE_BLOCK}", None,
      lambda s, b: expect(s, b, 200, [{"updated_block": PROFILE_BLOCK, "account_name": SMOKE_ACCOUNT,
                                      "avatar_url": AVATAR, "cover_url": COVER}])),
-    ("stream_accounts returns the seeded account with its hive_id", None, "GET", "/rpc/stream_accounts?after_id=0", None,
-     expect_smoke_account),
-    ("stream_urls pages of limit=2 cover the 5 urls of one block exactly once", None, page_urls, "/rpc/stream_urls", None,
+    ("stream_accounts returns the seeded account at the block that introduced it", None, "GET",
+     f"/rpc/stream_accounts?from_block={URL_BLOCK}&to_block={URL_BLOCK}", None,
+     expect_contains({"first_block": URL_BLOCK, "hive_id": SMOKE_HIVE_ID, "name": SMOKE_ACCOUNT})),
+    ("stream_urls pages of page_size=2 cover the 5 urls of one block exactly once", None,
+     pager("/rpc/stream_urls", "first_block", {"after_md5": "md5"}), "/rpc/stream_urls", None,
      lambda s, b: expect(s, sorted(r["md5"] for r in b), 200, sorted(md5(u) for u in PAGE_URLS))),
+    ("stream_url_authors pages of page_size=2 cover the 5 associations of one block exactly once", None,
+     pager("/rpc/stream_url_authors", "first_block", {"after_md5": "url_md5", "after_account": "account_name"}),
+     "/rpc/stream_url_authors", None,
+     lambda s, b: expect(s, sorted(r["url_md5"] for r in b), 200, sorted(md5(u) for u in PAGE_URLS))),
+    ("stream_url_authors rejects after_md5 without after_account", None, "GET",
+     f"/rpc/stream_url_authors?from_block={PAGE_BLOCK}&after_md5={md5(PAGE_URLS[0])}", None,
+     lambda s, b: expect(s, b, 400)),
     ("stream_urls rejects to_block below from_block", None, "GET", "/rpc/stream_urls?from_block=10&to_block=9", None,
      lambda s, b: expect(s, b, 400)),
     ("stream_profiles serves a changed avatar at its new block", change_avatar, "GET",
