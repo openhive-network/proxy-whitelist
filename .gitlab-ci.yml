@@ -11,8 +11,19 @@ variables:
   GIT_DEPTH: 0
   GIT_CLONE_PATH: $CI_BUILDS_DIR/fetch/$CI_RUNNER_SHORT_TOKEN/$CI_CONCURRENT_ID/$CI_PROJECT_PATH
 
+# AIDEV's task (ai/*) and session (session/*) branches are verified by its own
+# gates; aidev/integration is verified at promote and judged again by this CI when
+# its merge request to main is opened (merge-request pipelines) or run by hand.
+workflow:
+  rules:
+  - if: $CI_COMMIT_BRANCH =~ /^(ai|session)\//
+    when: never
+  - if: $CI_COMMIT_BRANCH == "aidev/integration" && $CI_PIPELINE_SOURCE !~ /^(web|api)$/
+    when: never
+  - if: $CI_COMMIT_TAG
+  - if: $CI_COMMIT_BRANCH
+  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 include:
-- template: Workflows/Branch-Pipelines.gitlab-ci.yml
 - project: 'hive/common-ci-configuration'
   ref: develop
   file:
