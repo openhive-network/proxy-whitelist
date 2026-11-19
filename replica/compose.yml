@@ -1,0 +1,93 @@
+# A proxy-whitelist replica next to an image server: a plain Postgres, the
+# syncer following a primary's /stream/* pages into it, and PostgREST plus the
+# primary's URL rewriter serving the same API from the replicated tables.
+#
+#   cp replica/.env.example replica/.env   # then edit
+#   docker compose -f replica/compose.yml --env-file replica/.env up -d
+#
+# See replica/README.md.
+name: proxy-whitelist-replica
+
+x-proxy-whitelist-image: &proxy-whitelist-image
+  image: ${PROXY_WHITELIST_IMAGE:-registry.gitlab.syncad.com/hive/proxy-whitelist:latest}
+  build:
+    context: ..
+    dockerfile: Dockerfile
+
+services:
+  replica-db:
+    image: ${REPLICA_POSTGRES_IMAGE:-postgres:18}
+    environment:
+      POSTGRES_DB: proxy_whitelist
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${REPLICA_DB_PASSWORD:?set REPLICA_DB_PASSWORD in replica/.env}
+    volumes:
+      - replica-db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d proxy_whitelist"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: always
+
+  replica-install:
+    <<: *proxy-whitelist-image
+    command: ["replica_install"]
+    environment:
+      POSTGRES_URL: postgresql://postgres:${REPLICA_DB_PASSWORD}@replica-db/proxy_whitelist
+      PROXY_WHITELIST_USER_PASSWORD: ${REPLICA_API_PASSWORD:?set REPLICA_API_PASSWORD in replica/.env}
+    depends_on:
+      replica-db:
+        condition: service_healthy
+
+  replica-sync:
+    <<: *proxy-whitelist-image
+    command: ["replica_sync"]
+    environment:
+      PROXY_WHITELIST_SOURCE_URL: ${PROXY_WHITELIST_SOURCE_URL:?set PROXY_WHITELIST_SOURCE_URL in replica/.env}
+      POSTGRES_URL: postgresql://postgres:${REPLICA_DB_PASSWORD}@replica-db/proxy_whitelist
+      POLL_INTERVAL_S: ${POLL_INTERVAL_S:-5}
+      PAGE_LIMIT: ${PAGE_LIMIT:-100000}
+      PROXY_WHITELIST_REPLICA_RESET: ${PROXY_WHITELIST_REPLICA_RESET:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      replica-install:
+        condition: service_completed_successfully
+    restart: always
+
+  replica-postgrest:
+    image: ${POSTGREST_IMAGE:-postgrest/postgrest:v12.0.2}
+    environment:
+      PGRST_DB_URI: postgresql://proxy_whitelist_user:${REPLICA_API_PASSWORD}@replica-db/proxy_whitelist
+      PGRST_DB_SCHEMAS: proxy_whitelist_endpoints
+      PGRST_DB_ANON_ROLE: proxy_whitelist_user
+      PGRST_DB_ROOT_SPEC: root
+      PGRST_DB_EXTRA_SEARCH_PATH: proxy_whitelist_app
+      PGRST_DB_POOL: ${REPLICA_POSTGREST_POOL:-20}
+      PGRST_SERVER_PORT: "3000"
+      PGRST_ADMIN_SERVER_PORT: "3001"
+    ports:
+      # /live and /ready for the health check agent
+      - "${REPLICA_POSTGREST_ADMIN_BIND:-127.0.0.1:3001}:3001"
+    networks:
+      default:
+        # the host name the rewriter's nginx.conf proxies to
+        aliases: [proxy-whitelist-postgrest]
+    depends_on:
+      replica-install:
+        condition: service_completed_successfully
+    restart: always
+
+  replica-rewriter:
+    image: ${PROXY_WHITELIST_REWRITER_IMAGE:-registry.gitlab.syncad.com/hive/proxy-whitelist/postgrest-rewriter:latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile.rewriter
+    ports:
+      - "${REPLICA_HTTP_BIND:-127.0.0.1:7010}:80"
+    depends_on:
+      - replica-postgrest
+    restart: always
+
+volumes:
+  replica-db-data:

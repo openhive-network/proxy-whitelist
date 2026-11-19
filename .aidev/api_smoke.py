@@ -19,6 +19,7 @@ PROXY_WHITELIST_TEST_ADMIN_URL, and makes the calls of CHECKS in order:
 Writes OUT_DIR/api-smoke.xml (one junit case per call) and exits non-zero when any
 call fails. The seeded rows are removed and the app's block restored at the end.
 """
+import contextlib
 import hashlib
 import json
 import os
@@ -30,7 +31,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from xml.sax.saxutils import escape, quoteattr
 
 STARTUP_TIMEOUT_S = 60
@@ -67,7 +68,8 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def call(base: str, method: str, path: str, body=None):
+def call_raw(base: str, method: str, path: str, body: Any = None) -> tuple[int, bytes]:
+    """The status and the undecoded body of a call; the response headers go to _last_headers."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(base + path, data=data, method=method,
                                  headers={"Content-Type": "application/json"} if data else {})
@@ -75,14 +77,22 @@ def call(base: str, method: str, path: str, body=None):
         with urllib.request.urlopen(req, timeout=30) as resp:
             _last_headers.clear()
             _last_headers.update(resp.headers.items())
-            raw = resp.read().decode()
-            return resp.status, (json.loads(raw) if raw else None)
+            return resp.status, resp.read()
     except urllib.error.HTTPError as err:
-        raw = err.read().decode()
-        try:
-            return err.code, json.loads(raw)
-        except ValueError:
-            return err.code, raw
+        _last_headers.clear()
+        _last_headers.update(err.headers.items())
+        return err.code, err.read()
+
+
+def call(base: str, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+    status, raw = call_raw(base, method, path, body)
+    text = raw.decode()
+    try:
+        return status, (json.loads(text) if text else None)
+    except ValueError:
+        if status < 400:
+            raise
+        return status, text
 
 
 def md5(text: str) -> str:
@@ -309,35 +319,65 @@ def write_junit(path: str, results) -> None:
         handle.write("\n".join(body) + "\n</testsuite>\n")
 
 
-def main(out_dir: str) -> int:
+class PostgrestDidNotStart(Exception):
+    pass
+
+
+@contextlib.contextmanager
+def postgrest(db_uri: str, log_path: str) -> Iterator[str]:
+    """PostgREST serving db_uri the way haf_api_node's proxy-whitelist-postgrest does, on a
+    free loopback port; yields its base URL. Raises PostgrestDidNotStart (see log_path)."""
     port = free_port()
     base = f"http://127.0.0.1:{port}"
     env = dict(os.environ,
-               PGRST_DB_URI=USER_URL,
+               PGRST_DB_URI=db_uri,
                PGRST_DB_SCHEMAS="proxy_whitelist_endpoints",
                PGRST_DB_ANON_ROLE="proxy_whitelist_user",
                PGRST_DB_ROOT_SPEC="root",
                PGRST_DB_EXTRA_SEARCH_PATH="proxy_whitelist_app",
                PGRST_SERVER_HOST="127.0.0.1",
                PGRST_SERVER_PORT=str(port))
-    log = open(os.path.join(out_dir, "postgrest.log"), "w", encoding="utf-8")
-    proc = subprocess.Popen(["postgrest"], env=env, stdout=log, stderr=subprocess.STDOUT)
-    results = []
-    try:
-        deadline = time.time() + STARTUP_TIMEOUT_S
-        while True:
+    with open(log_path, "w", encoding="utf-8") as log:
+        proc = subprocess.Popen(["postgrest"], env=env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.time() + STARTUP_TIMEOUT_S
+            while True:
+                try:
+                    status, _ = call_raw(base, "GET", "/rpc/sync_status")
+                    if status < 500:
+                        break
+                except (urllib.error.URLError, ConnectionError, OSError):
+                    pass
+                if proc.poll() is not None or time.time() > deadline:
+                    raise PostgrestDidNotStart(f"postgrest did not come up on {base}; see {log_path}")
+                time.sleep(0.5)
+            yield base
+        finally:
+            proc.terminate()
             try:
-                status, _ = call(base, "GET", "/rpc/sync_status")
-                if status < 500:
-                    break
-            except (urllib.error.URLError, ConnectionError, OSError):
-                pass
-            if proc.poll() is not None or time.time() > deadline:
-                print(f"postgrest did not come up on {base}; see postgrest.log", file=sys.stderr)
-                results.append(("postgrest start", 0.0, "postgrest did not start"))
-                write_junit(os.path.join(out_dir, "api-smoke.xml"), results)
-                return 1
-            time.sleep(0.5)
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def cleanup_quietly() -> None:
+    try:
+        cleanup()
+    except subprocess.CalledProcessError as exc:
+        print(f"cleanup failed: {exc.stderr}", file=sys.stderr)
+
+
+def main(out_dir: str) -> int:
+    results = []
+    with contextlib.ExitStack() as stack:
+        stack.callback(cleanup_quietly)
+        try:
+            base = stack.enter_context(postgrest(USER_URL, os.path.join(out_dir, "postgrest.log")))
+        except PostgrestDidNotStart as exc:
+            print(exc, file=sys.stderr)
+            results.append(("postgrest start", 0.0, "postgrest did not start"))
+            write_junit(os.path.join(out_dir, "api-smoke.xml"), results)
+            return 1
         for name, setup, method, path, body, check in CHECKS:
             t0 = time.time()
             error = ""
@@ -351,17 +391,6 @@ def main(out_dir: str) -> int:
                 error = f"{type(exc).__name__}: {exc}"
                 print(f"FAIL {name}: {error}", file=sys.stderr)
             results.append((name, time.time() - t0, error))
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        log.close()
-        try:
-            cleanup()
-        except subprocess.CalledProcessError as exc:
-            print(f"cleanup failed: {exc.stderr}", file=sys.stderr)
     write_junit(os.path.join(out_dir, "api-smoke.xml"), results)
     return 1 if any(r[2] for r in results) else 0
 

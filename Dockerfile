@@ -6,7 +6,8 @@ ARG PSQL_CLIENT_VERSION=da9ffb6003edfb5cbaf1dfcde8e1847667af7d24
 FROM registry.gitlab.syncad.com/hive/common-ci-configuration/psql:${PSQL_CLIENT_VERSION} AS psql_client
 
 USER root
-RUN apk add --no-cache curl
+# py3-psycopg (psycopg 3) for the replica syncer, replica/sync.py.
+RUN apk add --no-cache curl py3-psycopg
 
 USER haf_admin
 WORKDIR /home/haf_admin
@@ -49,6 +50,7 @@ COPY scripts/install_app.sh /app/scripts/install_app.sh
 COPY scripts/process_blocks.sh /app/scripts/process_blocks.sh
 COPY db /app/db
 COPY endpoints /app/endpoints
+COPY replica /app/replica
 COPY docker/scripts/docker-entrypoint.sh /app/docker-entrypoint.sh
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

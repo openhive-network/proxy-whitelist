@@ -30,10 +30,11 @@ issues:
 sandbox:
   compose: .aidev/test-stack.compose.yml
   resource_class: light
-  services: [haf, haf-init, hafah-install, reputation-tracker-install, hivemind-install, ready]
+  services: [haf, haf-init, hafah-install, reputation-tracker-install, hivemind-install, ready, replica-db]
   readiness_timeout: 600
   env:
     PROXY_WHITELIST_TEST_DB_HOST: haf
+    PROXY_WHITELIST_TEST_REPLICA_DB_HOST: replica-db
 # One junit report per suite from .aidev/run-checks.sh; each step is a case.
 verification:
   quick:
@@ -43,15 +44,15 @@ verification:
     artifacts: ["test-results/quick/"]
   full:
     adapter: command
-    args: [".aidev/run-checks.sh", "full", "shellcheck", "sqlfluff", "unit", "sql-registered", "install", "reinstall", "api-smoke"]
+    args: [".aidev/run-checks.sh", "full", "shellcheck", "sqlfluff", "unit", "sql-registered", "install", "reinstall", "api-smoke", "replica-install", "replica-sync", "replica-smoke"]
     artifacts: ["test-results/full/"]
   baseline:
     adapter: command
-    args: [".aidev/run-checks.sh", "baseline", "install", "reinstall", "api-smoke"]
+    args: [".aidev/run-checks.sh", "baseline", "install", "reinstall", "api-smoke", "replica-install", "replica-sync", "replica-smoke"]
     artifacts: ["test-results/baseline/"]
   canary:
     adapter: command
-    args: [".aidev/run-checks.sh", "canary", "shellcheck", "sqlfluff", "unit", "sql-registered", "install", "reinstall", "api-smoke"]
+    args: [".aidev/run-checks.sh", "canary", "shellcheck", "sqlfluff", "unit", "sql-registered", "install", "reinstall", "api-smoke", "replica-install", "replica-sync", "replica-smoke"]
     artifacts: ["test-results/canary/"]
   static:
     adapter: command
