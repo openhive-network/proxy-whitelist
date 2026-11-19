@@ -17,7 +17,8 @@
 #   - install         scripts/install_app.sh into the stack's HAF database
 #                     (PROXY_WHITELIST_TEST_DB_HOST, default `haf`), which already
 #                     has hivemind installed, through install_with_app_lock.py;
-#                     then the schema, the endpoint schema and the HAF context exist
+#                     then the schema, the endpoint schema and the HAF context exist,
+#                     and every tests/sql/*.sql check passes against the installed app
 #   - reinstall       install_app.sh a second time over the installed app (there is
 #                     no uninstall script; the installer is idempotent) and the
 #                     endpoint schema is still there
@@ -114,6 +115,13 @@ installed_ok() {
     [ "$(query "select to_regprocedure('proxy_whitelist_endpoints.check_url(text, text[])') is not null")" = t ] || { echo "check_url(text, text[]) is not installed"; return 1; }
     echo "schema, endpoint schema, HAF context and check_url present"
 }
+sql_checks() {
+    local f
+    for f in tests/sql/*.sql; do
+        echo "-- $f"
+        psql "$ADMIN_URL" -v ON_ERROR_STOP=on -f "$f" || return 1
+    done
+}
 install() {
     wait_for_db || return 1
     install_app "$@" || return 1
@@ -121,7 +129,8 @@ install() {
         echo "FAIL: install_app.sh ran without install_with_app_lock.py: the runtime image lacks /usr/local/bin/install_with_app_lock.py or install_app.sh no longer finds it"
         return 1
     fi
-    installed_ok
+    installed_ok || return 1
+    sql_checks
 }
 reinstall() {
     install_app || return 1
