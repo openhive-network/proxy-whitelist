@@ -29,6 +29,17 @@
 #                     url_accounts, sync_status, the root spec, the /stream/*
 #                     pages and avatar/cover (one junit case per call in
 #                     $out/api-smoke.xml)
+#   - replica-install replica/install.sh into a fresh database on the stack's plain
+#                     Postgres (PROXY_WHITELIST_TEST_REPLICA_DB_HOST, default
+#                     `replica-db`), twice; then the replicated tables, the state
+#                     row and the endpoint functions exist and the stream ones do not
+#   - replica-sync    .aidev/replica_smoke.py sync: replica/sync.py --once against
+#                     the installed primary served as api-smoke serves it, until
+#                     bootstrap_complete with the primary's counts
+#   - replica-smoke   .aidev/replica_smoke.py smoke: the primary seeded and followed
+#                     cycle by cycle (paging, new and quiet blocks, a pending url
+#                     author, an unreachable source, a changed sync_uuid and
+#                     --reset), the replica's answers compared byte for byte
 #
 # Reports go to test-results/<suite>/: junit.xml (one case per step) plus one log
 # per step, and the per-call junit of api-smoke.
@@ -42,6 +53,10 @@ DB_HOST="${PROXY_WHITELIST_TEST_DB_HOST:-haf}"
 ADMIN_URL="postgresql://haf_admin@$DB_HOST/haf_block_log"
 export PROXY_WHITELIST_TEST_ADMIN_URL="$ADMIN_URL"
 export PROXY_WHITELIST_TEST_USER_URL="postgresql://proxy_whitelist_user@$DB_HOST/haf_block_log"
+REPLICA_DB_HOST="${PROXY_WHITELIST_TEST_REPLICA_DB_HOST:-replica-db}"
+REPLICA_ADMIN_URL="postgresql://postgres@$REPLICA_DB_HOST/proxy_whitelist"
+export PROXY_WHITELIST_TEST_REPLICA_ADMIN_URL="$REPLICA_ADMIN_URL"
+export PROXY_WHITELIST_TEST_REPLICA_USER_URL="postgresql://proxy_whitelist_user@$REPLICA_DB_HOST/proxy_whitelist"
 status=0
 
 # record CASES_FILE NAME RC SECONDS LOG
@@ -144,6 +159,39 @@ reinstall() {
     echo "sync_uuid kept: $after"
 }
 
+# replica_query SQL: one value, as the replica's superuser
+replica_query() {
+    psql "$REPLICA_ADMIN_URL" -v ON_ERROR_STOP=on -Atc "$1"
+}
+replica_install() {
+    local i maintenance="postgresql://postgres@$REPLICA_DB_HOST/postgres"
+    for i in $(seq 60); do
+        psql "$maintenance" -Atc "select 1" > /dev/null 2>&1 && break
+        echo "waiting for $maintenance ($i)"
+        sleep 2
+    done
+    psql "$maintenance" -v ON_ERROR_STOP=on \
+        -c "drop database if exists proxy_whitelist with (force)" \
+        -c "create database proxy_whitelist" || return 1
+    bash replica/install.sh --postgres-url="$REPLICA_ADMIN_URL" || return 1
+    replica_query "update proxy_whitelist_replica.state set sync_error = 'kept by a reinstall'" || return 1
+    bash replica/install.sh --postgres-url="$REPLICA_ADMIN_URL" || return 1
+    [ "$(replica_query "select sync_error from proxy_whitelist_replica.state")" = "kept by a reinstall" ] \
+        || { echo "a reinstall replaced the syncer's state"; return 1; }
+    replica_query "update proxy_whitelist_replica.state set sync_error = null" || return 1
+    local t
+    for t in accounts urls url_authors account_profiles blacklisted_urls blacklisted_accounts; do
+        [ "$(replica_query "select to_regclass('proxy_whitelist_app.$t') is not null")" = t ] || { echo "no proxy_whitelist_app.$t"; return 1; }
+    done
+    [ "$(replica_query "select to_regprocedure('proxy_whitelist_endpoints.check_url(text, text[])') is not null")" = t ] \
+        || { echo "check_url(text, text[]) is not installed"; return 1; }
+    [ "$(replica_query "select count(*) from pg_proc where proname like 'stream\_%'")" = 0 ] \
+        || { echo "stream functions installed on the replica"; return 1; }
+    [ "$(replica_query "select proxy_whitelist_endpoints.sync_status()->>'bootstrap_complete'")" = false ] \
+        || { echo "sync_status() of a fresh replica is not bootstrap_complete = false"; return 1; }
+    echo "replica schema, state and endpoints present, no stream endpoints"
+}
+
 for s in "$@"; do
     case "$s" in
         shellcheck) step shellcheck run_shellcheck ;;
@@ -153,6 +201,9 @@ for s in "$@"; do
         install) step install install ;;
         reinstall) step reinstall reinstall ;;
         api-smoke) step api-smoke python3 .aidev/api_smoke.py "$out" ;;
+        replica-install) step replica-install replica_install ;;
+        replica-sync) step replica-sync python3 .aidev/replica_smoke.py sync "$out" ;;
+        replica-smoke) step replica-smoke python3 .aidev/replica_smoke.py smoke "$out" ;;
         *) echo "unknown step: $s" >&2; exit 2 ;;
     esac
 done

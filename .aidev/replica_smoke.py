@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Run replica/sync.py against the stack's primary and compare the replica's API with it.
+
+    replica_smoke.py sync OUT_DIR    bootstrap the replica from the installed primary
+    replica_smoke.py smoke OUT_DIR   seed the primary and check the replica follows it
+
+Both serve the primary (PROXY_WHITELIST_TEST_USER_URL) and the replica
+(PROXY_WHITELIST_TEST_REPLICA_USER_URL, installed by run-checks' replica-install
+step) with PostgREST the way api_smoke.py does, each behind an in-process
+rewriter that applies rewrite_rules.conf the way the postgrest-rewriter image
+does, so the syncer reads the primary's real /stream/* paths. replica/sync.py
+runs with --once as a subprocess (its logs go to OUT_DIR/replica-<mode>-sync-*.log).
+
+smoke seeds the primary at fixed blocks far above the testnet's (moving the
+app's processed block, like api_smoke.py), then checks, cycle by cycle: a
+PAGE_LIMIT=2 cycle over 5 urls of one block, byte-for-byte equal answers of
+check_url, is_whitelisted, url_accounts, avatar and cover, the replica's
+sync_status, 404 for /stream/*, new rows and empty cycles after bootstrap, a
+url author delivered below its url's block, an unreachable source and a
+changed source identity (refused, then --reset). Writes OUT_DIR/replica-<mode>.xml
+(one junit case per check); the seeded primary rows, block and sync_uuid are
+restored at the end.
+"""
+import contextlib
+import hashlib
+import http.server
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from typing import Any, Callable, Iterator
+
+from api_smoke import call, call_raw, free_port, postgrest, psql, write_junit, PostgrestDidNotStart
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+USER_URL = os.environ["PROXY_WHITELIST_TEST_USER_URL"]
+REPLICA_ADMIN_URL = os.environ["PROXY_WHITELIST_TEST_REPLICA_ADMIN_URL"]
+REPLICA_USER_URL = os.environ["PROXY_WHITELIST_TEST_REPLICA_USER_URL"]
+SYNC_TIMEOUT_S = 300
+
+PREFIX = f"https://aidev.invalid/replica/{int(time.time())}"
+ALICE, ALICE_ID = "aidev-replica-a", 2147000101
+BOB, BOB_ID = "aidev-replica-b", 2147000102
+CAROL, CAROL_ID = "aidev-replica-c", 2147000103
+UNKNOWN_ACCOUNT = "aidev-replica-none"
+URL1, BLACK, NEW, LATE, DOWN, AFTER_UUID = (f"{PREFIX}-{n}.png" for n in ("1", "black", "new", "late", "down", "uuid"))
+PAGE_URLS = [f"{PREFIX}-page-{i}.png" for i in range(5)]
+AVATAR, AVATAR2, COVER = (f"{PREFIX}-{n}.png" for n in ("avatar", "avatar2", "cover"))
+B = 910_000_000
+SEED_BLOCK, PAGE_BLOCK, PROFILE_BLOCK, HEAD1 = B + 10, B + 15, B + 20, B + 30
+NEW_BLOCK, QUIET_HEAD, LATE_AUTHOR_BLOCK, LATE_BLOCK, DOWN_BLOCK, UUID_BLOCK = B + 31, B + 40, B + 45, B + 50, B + 55, B + 60
+
+_restore: dict[str, Any] = {}
+
+
+def md5(text: str) -> str:
+    return hashlib.md5(text.encode()).hexdigest()
+
+
+def replica_sql(sql: str) -> str:
+    return subprocess.run(["psql", REPLICA_ADMIN_URL, "-v", "ON_ERROR_STOP=on", "-Atc", sql],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _rewrite_rules() -> list[tuple[re.Pattern[str], str]]:
+    rules = []
+    for line in (ROOT / "rewrite_rules.conf").read_text().splitlines():
+        m = re.match(r"\s*rewrite\s+(\S+)\s+(\S+)\s+break;", line)
+        if m:
+            rules.append((re.compile(m.group(1)), re.sub(r"\$(\d)", r"\\\1", m.group(2))))
+    return rules
+
+
+def rewrite(path_and_query: str, rules: list[tuple[re.Pattern[str], str]]) -> str:
+    """nginx's `rewrite ... break` of rewrite_rules.conf: the first matching rule rewrites the
+    path, and the request's arguments follow the replacement's own."""
+    path, _, query = path_and_query.partition("?")
+    for pattern, replacement in rules:
+        match = pattern.search(path)
+        if match:
+            path = match.expand(replacement)
+            break
+    if query:
+        path += ("&" if "?" in path else "?") + query
+    return path
+
+
+@contextlib.contextmanager
+def rewriter(upstream: str) -> Iterator[str]:
+    """An HTTP front of upstream (a PostgREST) applying rewrite_rules.conf; yields its base URL."""
+    rules = _rewrite_rules()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _forward(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else None
+            headers = {k: v for k, v in self.headers.items() if k.lower() in ("accept", "content-type")}
+            req = urllib.request.Request(upstream + rewrite(self.path, rules), data=body,
+                                         method=self.command, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=SYNC_TIMEOUT_S) as resp:
+                    status, resp_headers, payload = resp.status, resp.headers, resp.read()
+            except urllib.error.HTTPError as err:
+                status, resp_headers, payload = err.code, err.headers, err.read()
+            self.send_response(status)
+            for name, value in resp_headers.items():
+                if name.lower() not in ("transfer-encoding", "connection", "content-length", "date", "server"):
+                    self.send_header(name, value)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        do_GET = do_POST = _forward
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", free_port()), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+class Run:
+    """The two APIs and the syncer of one mode's run."""
+
+    def __init__(self, out_dir: str, mode: str, primary: str, replica: str) -> None:
+        self.out_dir = out_dir
+        self.mode = mode
+        self.primary = primary
+        self.replica = replica
+        self.syncs = 0
+
+    def sync(self, *args: str, source: str | None = None, page_limit: int = 100000) -> int:
+        self.syncs += 1
+        env = dict(os.environ, PROXY_WHITELIST_SOURCE_URL=source or self.primary, POSTGRES_URL=REPLICA_ADMIN_URL,
+                   PAGE_LIMIT=str(page_limit), PROXY_WHITELIST_REPLICA_RESET="0", LOG_LEVEL="DEBUG")
+        log_path = os.path.join(self.out_dir, self.log_name())
+        with open(log_path, "w", encoding="utf-8") as log:
+            return subprocess.run([sys.executable, str(ROOT / "replica" / "sync.py"), "--once", *args],
+                                  env=env, stdout=log, stderr=subprocess.STDOUT, timeout=SYNC_TIMEOUT_S).returncode
+
+    def synced(self, *args: str, **kwargs: Any) -> None:
+        rc = self.sync(*args, **kwargs)
+        assert rc == 0, f"replica/sync.py exited {rc}; see {self.log_name()}"
+
+    def log_name(self) -> str:
+        return f"replica-{self.mode}-sync-{self.syncs}.log"
+
+    def status(self) -> dict[str, Any]:
+        status, body = call(self.replica, "GET", "/sync-status")
+        assert status == 200 and isinstance(body, dict), f"replica /sync-status: HTTP {status} {body!r}"
+        return body
+
+    def same(self, method: str, path: str, body: Any = None, want_status: int = 200) -> bytes:
+        """Asserts the primary and the replica answer byte-for-byte alike; returns the answer."""
+        p_status, p_body = call_raw(self.primary, method, path, body)
+        r_status, r_body = call_raw(self.replica, method, path, body)
+        assert p_status == want_status, f"primary {method} {path}: HTTP {p_status} {p_body!r}"
+        assert (r_status, r_body) == (p_status, p_body), \
+            f"{method} {path}: primary {p_status} {p_body!r}, replica {r_status} {r_body!r}"
+        return r_body
+
+
+def primary_head() -> int:
+    return int(psql("select current_block_num from hafd.contexts where name = 'proxy_whitelist_app'"))
+
+
+def primary_sync_uuid() -> str:
+    return psql("select sync_uuid from proxy_whitelist_app.app_status")
+
+
+def set_head(block: int) -> None:
+    psql(f"set role proxy_whitelist_owner; select hive.app_set_current_block_num('proxy_whitelist_app', {block});")
+
+
+def whitelist(urls: list[str], account: str, hive_id: int, block: int) -> None:
+    listed = ", ".join(f"'{u}'" for u in urls)
+    psql(f"""
+        set role proxy_whitelist_owner;
+        select proxy_whitelist_app.whitelist_urls(
+            array[{listed}], proxy_whitelist_app.ensure_account({hive_id}, '{account}', {block}), {block});
+    """)
+
+
+def set_profile(account: str, hive_id: int, avatar: str, cover: str, block: int) -> None:
+    psql(f"""
+        set role proxy_whitelist_owner;
+        select proxy_whitelist_app.set_account_profile({hive_id}, '{account}', '{avatar}', '{cover}', {block});
+    """)
+
+
+def counts(run_sql: Callable[[str], str]) -> str:
+    return run_sql("""
+        select format('accounts %s, urls %s, url_authors %s, profiles %s, blacklisted urls %s, blacklisted accounts %s',
+            (select count(*) from proxy_whitelist_app.accounts),
+            (select count(*) from proxy_whitelist_app.urls),
+            (select count(*) from proxy_whitelist_app.url_authors),
+            (select count(*) from proxy_whitelist_app.account_profiles),
+            (select count(*) from proxy_whitelist_app.blacklisted_urls),
+            (select count(*) from proxy_whitelist_app.blacklisted_accounts))""")
+
+
+def same_counts() -> None:
+    primary, replica = counts(psql), counts(replica_sql)
+    assert primary == replica, f"primary has {primary}, replica {replica}"
+
+
+def same_answers(run: Run) -> None:
+    for url in (URL1, BLACK, PAGE_URLS[0], f"{PREFIX}-unseen.png"):
+        run.same("POST", "/whitelist/check", {"url": url})
+        run.same("POST", "/whitelist/is-whitelisted", {"url": url})
+        run.same("POST", "/whitelist/url-accounts", {"url": url})
+    run.same("POST", "/whitelist/check", {"url": URL1, "blacklisted_accounts": [ALICE]})
+    run.same("POST", "/whitelist/check", {"url": URL1, "blacklisted_accounts": ["someone-else"]})
+    run.same("POST", "/whitelist/url-blacklisted", {"url": BLACK})
+    for account in (ALICE, BOB):
+        run.same("GET", f"/avatar/{account}")
+        run.same("GET", f"/cover/{account}")
+    run.same("GET", f"/avatar/{UNKNOWN_ACCOUNT}", want_status=404)
+
+
+def seed() -> None:
+    _restore["head"] = primary_head()
+    _restore["sync_uuid"] = primary_sync_uuid()
+    whitelist([URL1, BLACK], ALICE, ALICE_ID, SEED_BLOCK)
+    whitelist(PAGE_URLS, ALICE, ALICE_ID, PAGE_BLOCK)
+    psql(f"""
+        set role proxy_whitelist_owner;
+        select proxy_whitelist_app.ensure_account({BOB_ID}, '{BOB}', {PAGE_BLOCK});
+        insert into proxy_whitelist_app.blacklisted_urls (url_id)
+            select id from proxy_whitelist_app.urls where url = '{BLACK}';
+    """)
+    set_profile(ALICE, ALICE_ID, AVATAR, COVER, PROFILE_BLOCK)
+    set_head(HEAD1)
+
+
+def cleanup() -> None:
+    urls = f"(select id from proxy_whitelist_app.urls where url like '{PREFIX}%')"
+    accounts = f"(select id from proxy_whitelist_app.accounts where name in ('{ALICE}', '{BOB}', '{CAROL}'))"
+    restore = ""
+    if "head" in _restore:
+        restore = f"""
+            select hive.app_set_current_block_num('proxy_whitelist_app', {_restore['head']});
+            update proxy_whitelist_app.app_status set sync_uuid = '{_restore['sync_uuid']}';"""
+    psql(f"""
+        set role proxy_whitelist_owner;
+        delete from proxy_whitelist_app.blacklisted_urls where url_id in {urls};
+        delete from proxy_whitelist_app.url_authors where url_id in {urls};
+        delete from proxy_whitelist_app.urls where id in {urls};
+        delete from proxy_whitelist_app.account_profiles where account_id in {accounts};
+        delete from proxy_whitelist_app.accounts where id in {accounts};
+        {restore}
+    """)
+
+
+def check_bootstrap(run: Run) -> None:
+    run.synced()
+    status = run.status()
+    assert status["bootstrap_complete"] is True, f"bootstrap_complete in {status}"
+    assert status["sync_error"] is None, f"sync_error in {status}"
+    assert status["last_block_num"] == primary_head(), f"last_block_num {status['last_block_num']}, primary {primary_head()}"
+    assert status["source_sync_uuid"] == primary_sync_uuid(), f"source_sync_uuid in {status}"
+    same_counts()
+
+
+def check_paged_cycle(run: Run) -> None:
+    seed()
+    run.synced(page_limit=2)
+    got = replica_sql(f"select count(*) from proxy_whitelist_app.urls where url like '{PREFIX}-page-%'")
+    assert got == "5", f"{got} page urls on the replica"
+    same_counts()
+
+
+def check_sync_status_shape(run: Run) -> None:
+    _, primary = call(run.primary, "GET", "/sync-status")
+    status = run.status()
+    missing = set(primary) - set(status)
+    assert not missing, f"replica /sync-status lacks the primary's {missing}"
+    extra = {"source_sync_uuid", "source_url", "polled_at", "bootstrap_complete", "sync_error"}
+    assert extra <= set(status), f"replica /sync-status lacks {extra - set(status)}"
+    assert status["last_block_num"] == HEAD1 and status["sync_uuid"] == primary["sync_uuid"], f"{status} vs {primary}"
+    assert status["source_url"] == run.primary and status["polled_at"], f"{status}"
+
+
+def check_no_streams(run: Run) -> None:
+    for path in ("/stream/urls?from_block=0&page_size=1", "/stream/blacklists"):
+        status, body = call(run.replica, "GET", path)
+        assert status == 404, f"replica GET {path}: HTTP {status} {body!r}"
+
+
+def check_new_rows(run: Run) -> None:
+    whitelist([NEW], CAROL, CAROL_ID, NEW_BLOCK)
+    set_profile(ALICE, ALICE_ID, AVATAR2, COVER, NEW_BLOCK)
+    set_head(NEW_BLOCK)
+    run.synced()
+    assert run.same("POST", "/whitelist/check", {"url": NEW}) == b'"whitelisted"'
+    assert json.loads(run.same("GET", f"/avatar/{ALICE}")) == AVATAR2
+    assert run.status()["last_block_num"] >= NEW_BLOCK
+
+
+def check_quiet_cycles(run: Run) -> None:
+    for head in (QUIET_HEAD - 5, QUIET_HEAD):
+        set_head(head)
+        run.synced()
+        assert run.status()["last_block_num"] == head, f"{run.status()} after head {head}"
+    cursors = replica_sql("select accounts_block, urls_block, url_authors_block, profiles_block from proxy_whitelist_replica.state")
+    assert cursors == "|".join([str(QUIET_HEAD)] * 4), f"cursors {cursors}"
+
+
+def check_pending_author(run: Run) -> None:
+    whitelist([LATE], BOB, BOB_ID, LATE_BLOCK)
+    psql(f"""
+        set role proxy_whitelist_owner;
+        update proxy_whitelist_app.url_authors set first_block = {LATE_AUTHOR_BLOCK}
+        where url_id = (select id from proxy_whitelist_app.urls where url = '{LATE}');
+    """)
+    set_head(LATE_AUTHOR_BLOCK)
+    run.synced()
+    pending = replica_sql("select url_md5 || ' ' || account_name from proxy_whitelist_replica.pending_url_authors")
+    assert pending == f"{md5(LATE)} {BOB}", f"pending_url_authors: {pending!r}"
+    set_head(LATE_BLOCK)
+    run.synced()
+    assert replica_sql("select count(*) from proxy_whitelist_replica.pending_url_authors") == "0"
+    assert json.loads(run.same("POST", "/whitelist/url-accounts", {"url": LATE})) == [{"account": BOB}]
+
+
+def check_unreachable_source(run: Run) -> None:
+    before = run.status()
+    whitelist([DOWN], CAROL, CAROL_ID, DOWN_BLOCK)
+    set_head(DOWN_BLOCK)
+    rc = run.sync(source=f"http://127.0.0.1:{free_port()}")
+    assert rc == 1, f"replica/sync.py exited {rc} with the source down"
+    down = run.status()
+    assert down["sync_error"], f"no sync_error with the source down: {down}"
+    assert (down["last_block_num"], down["last_block_time"]) == (before["last_block_num"], before["last_block_time"]), \
+        f"{down} advanced from {before}"
+    run.synced()
+    assert run.status()["sync_error"] is None and run.status()["last_block_num"] == DOWN_BLOCK
+    same_counts()
+
+
+def check_identity_change(run: Run) -> None:
+    psql(f"update proxy_whitelist_app.app_status set sync_uuid = '{uuid.uuid4()}'")
+    whitelist([AFTER_UUID], CAROL, CAROL_ID, UUID_BLOCK)
+    set_head(UUID_BLOCK)
+    rc = run.sync()
+    assert rc == 2, f"replica/sync.py exited {rc} on a changed sync_uuid"
+    status = run.status()
+    assert status["sync_error"] and "sync_uuid" in status["sync_error"], f"{status}"
+    assert status["last_block_num"] == DOWN_BLOCK, f"{status}"
+    assert call(run.replica, "POST", "/whitelist/check", {"url": AFTER_UUID})[1] == "unknown"
+    assert call(run.replica, "POST", "/whitelist/check", {"url": URL1})[1] == "whitelisted"
+    run.synced("--reset")
+    status = run.status()
+    assert status["source_sync_uuid"] == primary_sync_uuid() and status["sync_error"] is None, f"{status}"
+    same_counts()
+    same_answers(run)
+
+
+SMOKE_CHECKS: list[tuple[str, Callable[[Run], None]]] = [
+    ("a PAGE_LIMIT=2 cycle replicates exactly the 5 urls of one block", check_paged_cycle),
+    ("check_url, is_whitelisted, url_accounts, avatar and cover answer like the primary", same_answers),
+    ("sync_status has the primary's fields and the replica's", check_sync_status_shape),
+    ("the replica serves no /stream/*", check_no_streams),
+    ("rows added after bootstrap arrive in the next cycle", check_new_rows),
+    ("cycles without new rows advance to the source's block", check_quiet_cycles),
+    ("a url author below its url's block waits in pending_url_authors", check_pending_author),
+    ("an unreachable source sets sync_error and freezes last_block_time; syncing resumes", check_unreachable_source),
+    ("a changed sync_uuid is refused, --reset bootstraps again to equality", check_identity_change),
+]
+MODES: dict[str, list[tuple[str, Callable[[Run], None]]]] = {
+    "sync": [("a fresh replica bootstraps from the primary", check_bootstrap)],
+    "smoke": SMOKE_CHECKS,
+}
+
+
+def main(mode: str, out_dir: str) -> int:
+    results = []
+    with contextlib.ExitStack() as stack:
+        stack.callback(cleanup)
+        try:
+            primary = stack.enter_context(rewriter(stack.enter_context(
+                postgrest(USER_URL, os.path.join(out_dir, f"replica-{mode}-primary-postgrest.log")))))
+            replica = stack.enter_context(rewriter(stack.enter_context(
+                postgrest(REPLICA_USER_URL, os.path.join(out_dir, f"replica-{mode}-postgrest.log")))))
+        except PostgrestDidNotStart as exc:
+            print(exc, file=sys.stderr)
+            results.append(("postgrest start", 0.0, str(exc)))
+            write_junit(os.path.join(out_dir, f"replica-{mode}.xml"), results)
+            return 1
+        run = Run(out_dir, mode, primary, replica)
+        for name, check in MODES[mode]:
+            t0 = time.time()
+            error = ""
+            try:
+                check(run)
+                print(f"ok   {name}")
+            except (AssertionError, subprocess.SubprocessError, OSError, ValueError, KeyError) as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                print(f"FAIL {name}: {error}", file=sys.stderr)
+            results.append((name, time.time() - t0, error))
+            if error:
+                break
+    write_junit(os.path.join(out_dir, f"replica-{mode}.xml"), results)
+    return 1 if any(r[2] for r in results) else 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3 or sys.argv[1] not in MODES:
+        sys.exit(f"usage: {sys.argv[0]} {'|'.join(MODES)} OUT_DIR")
+    sys.exit(main(sys.argv[1], sys.argv[2]))

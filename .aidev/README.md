@@ -29,7 +29,11 @@ reputation_tracker and hivemind installed — install the app into it twice, and
 `.aidev/api_smoke.py`, which serves the installed schema with PostgREST the way
 haf_api_node's `proxy-whitelist-postgrest` does and checks `check_url`
 (unknown → whitelisted → blacklisted, and the caller's `blacklisted_accounts`),
-`url_accounts`, `sync_status` and the root spec.
+`url_accounts`, `sync_status` and the root spec. The `full`, `canary` and
+`baseline` slots then install the replica (`replica/`) into the stack's plain
+Postgres (`replica-db`), bootstrap it with `replica/sync.py` from the primary and
+run `.aidev/replica_smoke.py`, which follows the seeded primary cycle by cycle and
+compares the two APIs' answers byte for byte.
 
 Not covered by the slots: block processing (the main loop waits for hivemind to
 reach the block, and the testnet hivemind has no synced posts) — the production

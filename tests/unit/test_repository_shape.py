@@ -17,6 +17,16 @@ def test_every_sql_file_is_applied_by_install_app() -> None:
     assert not missing, f"not applied by scripts/install_app.sh: {missing}"
 
 
+def test_replica_install_applies_every_replica_sql_file_and_no_stream_endpoints() -> None:
+    replica_install = (ROOT / "replica" / "install.sh").read_text()
+    files = sorted(str(p.relative_to(ROOT)) for p in (ROOT / "replica" / "db").glob("*.sql"))
+    missing = [f for f in files if f'$SRCPATH/{f}"' not in replica_install]
+    assert not missing, f"not applied by replica/install.sh: {missing}"
+    # A replica is not a stream source, and its sync_status() replaces the HAF one.
+    for primary_only in ("endpoints/stream.sql", "endpoints/sync_status.sql"):
+        assert primary_only not in replica_install, f"replica/install.sh applies {primary_only}"
+
+
 def test_rewrite_rules_point_at_installed_endpoint_functions() -> None:
     rules = (ROOT / "rewrite_rules.conf").read_text()
     targets = re.findall(r"\s/rpc/([a-z_]+)[\s?]", rules)

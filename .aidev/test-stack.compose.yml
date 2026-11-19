@@ -2,6 +2,8 @@
 # api-smoke steps: a HAF testnet with hafah, reputation_tracker and hivemind
 # installed (hivemind's setup needs the first two; proxy-whitelist's
 # install_app.sh needs the hivemind role and hivemind's application-registry row).
+# replica-db is the plain Postgres replica/install.sh and replica/sync.py are
+# tested against (the run-checks replica-* steps).
 # Pins follow hivesense's .aidev/test-stack.compose.yml (HAF `develop`, apps 1.28.8-rc3).
 x-haf-upstream-branch: "develop"
 x-apps-release: "1.28.8-rc3"
@@ -62,3 +64,13 @@ services:
     depends_on:
       hivemind-install:
         condition: service_completed_successfully
+  replica-db:
+    image: postgres:18@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: proxy_whitelist
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d proxy_whitelist"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
