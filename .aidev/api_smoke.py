@@ -13,8 +13,9 @@ PROXY_WHITELIST_TEST_ADMIN_URL, and makes the calls of CHECKS in order:
   (seeded author blacklisted by the caller) unknown → (url blacklisted) blacklisted,
   url_accounts of the seeded URL, then the /stream/* pages (seeded at fixed
   blocks, with the app's processed block moved past them; paged with
-  page_size=2 by following Stream-To-Block), a profile change, and
-  avatar/cover.
+  page_size=2 by following Stream-To-Block), a profile change, avatar/cover,
+  and hivemind accounts that never posted (seeded in hivemind_app.hive_accounts
+  and tracked at one block): their /stream/accounts pages and avatar/cover.
 
 Writes OUT_DIR/api-smoke.xml (one junit case per call) and exits non-zero when any
 call fails. The seeded rows are removed and the app's block restored at the end.
@@ -44,14 +45,19 @@ SMOKE_HIVE_ID = 2147000001
 PLAIN_ACCOUNT = "aidev-smoke-np"
 PLAIN_HIVE_ID = 2147000002
 UNKNOWN_ACCOUNT = "aidev-smoke-none"
+# Hivemind accounts above every id of the stack's hivemind, with no post or profile.
+HIVEMIND_ACCOUNTS = {2147000101 + i: f"aidev-smoke-hm{i}" for i in range(5)}
+HIVEMIND_ACCOUNT = HIVEMIND_ACCOUNTS[2147000101]
 PAGE_URLS = [f"{SMOKE_PREFIX}-page-{i}.png" for i in range(5)]
 AVATAR, AVATAR2, COVER = (f"{SMOKE_PREFIX}-{n}.png" for n in ("avatar", "avatar2", "cover"))
 # Fixed blocks far above a testnet's: the streams serve only blocks the app has
 # processed, so seeding moves the app's block to STREAM_HEAD (restored by cleanup).
-URL_BLOCK, PAGE_BLOCK, PROFILE_BLOCK, CHANGE_BLOCK, STREAM_HEAD = (
-    900_000_010, 900_000_015, 900_000_020, 900_000_030, 900_000_100)
+URL_BLOCK, PAGE_BLOCK, PROFILE_BLOCK, CHANGE_BLOCK, ACCOUNTS_BLOCK, STREAM_HEAD = (
+    900_000_010, 900_000_015, 900_000_020, 900_000_030, 900_000_040, 900_000_100)
 PAGE_TO = PAGE_BLOCK + 3
+ACCOUNTS_TO = ACCOUNTS_BLOCK + 3
 _original_head = None
+_original_tracked: str | None = None
 _last_headers: dict[str, str] = {}
 
 
@@ -134,6 +140,17 @@ def change_avatar() -> None:
     """)
 
 
+def seed_hivemind_accounts() -> None:
+    global _original_tracked
+    _original_tracked = psql("select coalesce(accounts_tracked_hive_id::text, 'null') from proxy_whitelist_app.app_status")
+    rows = ", ".join(f"({i}, '{n}', now())" for i, n in HIVEMIND_ACCOUNTS.items())
+    psql(f"""
+        insert into hivemind_app.hive_accounts (id, name, created_at) values {rows};
+        set role proxy_whitelist_owner;
+        select proxy_whitelist_app.track_account_creations({ACCOUNTS_BLOCK});
+    """)
+
+
 def blacklist_url() -> None:
     psql(f"""
         set role proxy_whitelist_owner;
@@ -144,10 +161,15 @@ def blacklist_url() -> None:
 
 def cleanup() -> None:
     smoke_urls = f"(select id from proxy_whitelist_app.urls where url like '{SMOKE_PREFIX}%')"
-    smoke_accounts = f"(select id from proxy_whitelist_app.accounts where name in ('{SMOKE_ACCOUNT}', '{PLAIN_ACCOUNT}'))"
+    names = ", ".join(f"'{n}'" for n in (SMOKE_ACCOUNT, PLAIN_ACCOUNT, *HIVEMIND_ACCOUNTS.values()))
+    smoke_accounts = f"(select id from proxy_whitelist_app.accounts where name in ({names}))"
+    hivemind_ids = ", ".join(str(i) for i in HIVEMIND_ACCOUNTS)
     restore = (f"select hive.app_set_current_block_num('proxy_whitelist_app', {_original_head});"
                if _original_head is not None else "")
+    if _original_tracked is not None:
+        restore += f" update proxy_whitelist_app.app_status set accounts_tracked_hive_id = {_original_tracked};"
     psql(f"""
+        delete from hivemind_app.hive_accounts where id in ({hivemind_ids});
         set role proxy_whitelist_owner;
         delete from proxy_whitelist_app.blacklisted_urls where url_id in {smoke_urls};
         delete from proxy_whitelist_app.url_authors where url_id in {smoke_urls};
@@ -198,21 +220,22 @@ def header(name: str) -> str | None:
     return next((v for k, v in _last_headers.items() if k.lower() == name.lower()), None)
 
 
-def pager(path: str, block_field: str, cursor: dict[str, str]) -> Callable[[str], tuple[int, Any]]:
-    """A reader of the 5 rows of PAGE_BLOCK from a stream over [PAGE_BLOCK, PAGE_TO], with page_size=2.
+def pager(path: str, block_field: str, cursor: dict[str, str],
+          block: int = PAGE_BLOCK, to: int = PAGE_TO) -> Callable[[str], tuple[int, Any]]:
+    """A reader of the 5 rows of `block` from a stream over [block, to], with page_size=2.
 
     Each page continues from (Stream-To-Block, the last row's cursor fields). The pages
     must hold 2, 2 and 1 rows, a full page's Stream-To-Block being its last row's
-    block and the short one's the applied upper bound PAGE_TO.
+    block and the short one's the applied upper bound `to`.
     """
     def read(base: str) -> tuple[int, Any]:
-        rows, sizes, from_block, after = [], [], PAGE_BLOCK, ""
+        rows, sizes, from_block, after = [], [], block, ""
         while True:
-            status, page = call(base, "GET", f"{path}?from_block={from_block}&to_block={PAGE_TO}&page_size=2{after}")
+            status, page = call(base, "GET", f"{path}?from_block={from_block}&to_block={to}&page_size=2{after}")
             if status != 200:
                 return status, page
             to_block = int(header("Stream-To-Block") or -1)
-            want = page[-1][block_field] if len(page) == 2 else PAGE_TO
+            want = page[-1][block_field] if len(page) == 2 else to
             assert to_block == want, f"Stream-To-Block {to_block} for a page of {len(page)}, expected {want}"
             rows += page
             sizes.append(len(page))
@@ -304,6 +327,16 @@ CHECKS: list[tuple[str, Callable[[], None] | None, str | Callable[[str], tuple[i
      lambda s, b: expect(s, b, 404)),
     ("cover of an unknown account is 404", None, "GET", f"/rpc/cover?name={UNKNOWN_ACCOUNT}", None,
      lambda s, b: expect(s, b, 404)),
+    ("stream_accounts pages of page_size=2 cover the 5 hivemind accounts tracked at one block exactly once",
+     seed_hivemind_accounts,
+     pager("/rpc/stream_accounts", "first_block", {"after_name": "name"}, ACCOUNTS_BLOCK, ACCOUNTS_TO),
+     "/rpc/stream_accounts", None,
+     lambda s, b: expect(s, sorted((r["first_block"], r["hive_id"], r["name"]) for r in b), 200,
+                         sorted((ACCOUNTS_BLOCK, i, n) for i, n in HIVEMIND_ACCOUNTS.items()))),
+    ("avatar of a hivemind account that never posted is null", None, "GET",
+     f"/rpc/avatar?name={HIVEMIND_ACCOUNT}", None, expect_url(None)),
+    ("cover of a hivemind account that never posted is null", None, "GET",
+     f"/rpc/cover?name={HIVEMIND_ACCOUNT}", None, expect_url(None)),
 ]
 
 
