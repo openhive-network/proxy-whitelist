@@ -30,7 +30,9 @@ replica/healthcheck/proxy_whitelist_replica.sh against the replica's PostgREST
 admin server and database: up when in sync, down (exit 10) when last_block_time
 is older than 60 s, before the bootstrap completes and when PostgREST is not
 live. The testnet primary produces no blocks, so the age is set in the
-replica's state rather than waited for.
+replica's state rather than waited for. Every case runs twice: with the suite's
+psql and with a shim that, like the image's psql 14, prints only the last
+statement's result of a multi-statement --command.
 """
 import contextlib
 import hashlib
@@ -449,14 +451,43 @@ for a in "$@"; do
 done
 exec %s "${args[@]}"
 """
+# psql before 15 (the proxy-whitelist image's is 14): of a --command holding several
+# statements it prints only the last statement's result. Emulated with the suite's
+# psql in one session: every statement but the last runs with output to /dev/null.
+# Statements are split at every ';' (the agent's queries hold no quoted ';').
+PSQL_BEFORE_15 = """#!/bin/bash
+args=()
+for a in "$@"; do
+  case $a in
+    --command=*|-c*)
+      [[ $a == --command=* ]] && sql=${a#--command=} || sql=${a#-c}
+      IFS=';' read -ra parts <<< "$sql"
+      stmts=()
+      for p in "${parts[@]}"; do [[ $p =~ [^[:space:]] ]] && stmts+=("$p"); done
+      if (( ${#stmts[@]} > 1 )); then
+        head=$(IFS=';'; echo "${stmts[*]:0:${#stmts[@]}-1}")
+        args+=(-c '\\o /dev/null' -c "$head" -c '\\o' -c "${stmts[-1]}")
+      else
+        args+=("$a")
+      fi ;;
+    *) args+=("$a") ;;
+  esac
+done
+exec %s "${args[@]}"
+"""
 
 
-def agent(live_url: str) -> tuple[int, str]:
-    """One run of the agent check: its exit status and its answer."""
+def agent(live_url: str, psql_before_15: bool) -> tuple[int, str]:
+    """One run of the agent check: its exit status and its answer. psql_before_15 runs it
+    with a psql printing only the last statement's result, like the image's psql 14."""
     with tempfile.TemporaryDirectory() as bin_dir:
-        date = pathlib.Path(bin_dir) / "date"
-        date.write_text(BUSYBOX_DATE % shutil.which("date"))
-        date.chmod(0o755)
+        shims = {"date": BUSYBOX_DATE % shutil.which("date")}
+        if psql_before_15:
+            shims["psql"] = PSQL_BEFORE_15 % shutil.which("psql")
+        for name, text in shims.items():
+            shim = pathlib.Path(bin_dir) / name
+            shim.write_text(text)
+            shim.chmod(0o755)
         env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}",
                    REPLICA_LIVE_URL=live_url, REPLICA_POSTGRES_URL=REPLICA_USER_URL)
         done = subprocess.run(["sh", str(AGENT)], env=env, capture_output=True, text=True, timeout=30)
@@ -470,15 +501,21 @@ def check_health(run: Run) -> None:
     live = f"{run.admin}/live"
     state = replica_sql("select source_block_num, source_block_time from proxy_whitelist_replica.state")
     try:
-        replica_sql("update proxy_whitelist_replica.state set source_block_time = now()")
-        assert agent(live) == (0, "up"), f"in sync: {agent(live)}"
-        replica_sql("update proxy_whitelist_replica.state set source_block_time = now() - interval '2 minutes'")
-        rc, answer = agent(live)
-        assert (rc, answer.split(" (")[0]) == (10, "down #proxy_whitelist_replica block too old"), f"stale: {rc} {answer!r}"
-        assert agent(f"http://127.0.0.1:{free_port()}/live") == (10, "down #proxy_whitelist_replica postgrest not live")
-        replica_sql("update proxy_whitelist_replica.state set source_block_num = null, source_block_time = null, "
-                    "bootstrap_complete = false")
-        assert agent(live) == (10, "down #proxy_whitelist_replica has no processed block yet"), f"{agent(live)}"
+        for before_15 in (True, False):
+            psql_ = "psql < 15" if before_15 else "psql >= 15"
+            replica_sql("update proxy_whitelist_replica.state set bootstrap_complete = true, "
+                        f"source_block_num = {state.partition('|')[0] or 1}, source_block_time = now()")
+            assert agent(live, before_15) == (0, "up"), f"in sync, {psql_}: {agent(live, before_15)}"
+            replica_sql("update proxy_whitelist_replica.state set source_block_time = now() - interval '2 minutes'")
+            rc, answer = agent(live, before_15)
+            assert (rc, answer.split(" (")[0]) == (10, "down #proxy_whitelist_replica block too old"), \
+                f"stale, {psql_}: {rc} {answer!r}"
+            assert agent(f"http://127.0.0.1:{free_port()}/live", before_15) == \
+                (10, "down #proxy_whitelist_replica postgrest not live"), psql_
+            replica_sql("update proxy_whitelist_replica.state set source_block_num = null, source_block_time = null, "
+                        "bootstrap_complete = false")
+            assert agent(live, before_15) == (10, "down #proxy_whitelist_replica has no processed block yet"), \
+                f"{psql_}: {agent(live, before_15)}"
     finally:
         block, _, time_ = state.partition("|")
         replica_sql(f"update proxy_whitelist_replica.state set bootstrap_complete = true, "
