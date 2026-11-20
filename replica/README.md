@@ -186,9 +186,10 @@ replica: it first runs `check_haf_lib`, which queries `hive.is_instance_ready()`
 `hafd.blocks` and `hafd.hive_state`, so on the replica's plain Postgres it
 answers `down #HAF query failed` whatever the sync state.
 `replica/healthcheck/proxy_whitelist_replica.sh` is that script without the HAF
-gate: haf_api_node's `check_sync_status` (PostgREST's `/live`, then
+gate: PostgREST's `/live` (haf_api_node's `check_postgrest_live`), then
 `proxy_whitelist_endpoints.sync_status()` called with psql as
-`proxy_whitelist_user`, and the age of `last_block_time` against 60 s). It
+`proxy_whitelist_user`, and the age of `last_block_time` against 60 s
+(haf_api_node's `check_http_block_time`). It
 prints `up`, or `down #<reason>` and exits 10, like the stock agents, so
 haproxy's `agent-check` uses it unchanged: up when in sync, down within a minute
 of the primary or the syncer stopping, during a bootstrap or rebuild, and when
@@ -199,6 +200,16 @@ haf_api_node's `check_http_sync_age.sh` and `format_seconds.sh` are
 so the script runs from the proxy-whitelist image without haf_api_node; update
 them from there when haf_api_node changes them. They are written for busybox
 (`date -d "YYYY.MM.DD-HH:MM:SS"`), which the image has.
+
+The sync-status query is the script's own, not `check_sync_status`'s. That one
+sends `BEGIN; SET LOCAL search_path …; SELECT …; COMMIT` as one `--command`, and
+psql before 15 prints only the last statement's result (`COMMIT`'s, nothing), so
+with the image's psql 14 every probe read `down #… has no processed block yet`.
+The script sends the `SELECT` alone, with the search_path as a startup option
+(`PGOPTIONS`), which works with **any psql** (the replica's plain Postgres has no
+pgbouncer to drop it). Keep any query the agent runs a single statement as long
+as the image's psql is older than 15; `.aidev/replica_smoke.py health` runs every
+case also with a psql that prints only the last statement's result.
 
 The **replica-agent** service runs it from the proxy-whitelist image, one check
 per connection (`nc -lk -p 7015 -e …`), on `REPLICA_AGENT_BIND`, reaching
