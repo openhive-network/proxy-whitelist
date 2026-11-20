@@ -20,11 +20,14 @@ from typing import Any
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+# sync.py imports its sibling purge.py, as it does when run as a script.
+sys.path.insert(0, str(ROOT / "replica"))
 _spec = importlib.util.spec_from_file_location("replica_sync", ROOT / "replica" / "sync.py")
 assert _spec is not None and _spec.loader is not None
 sync = importlib.util.module_from_spec(_spec)
 sys.modules["replica_sync"] = sync
 _spec.loader.exec_module(sync)
+purge = importlib.import_module("purge")
 
 UUID = "0b5f8f0e-6c3e-4a51-9a49-3f2f0c1d7e21"
 OTHER_UUID = "7d3c2b1a-0000-4000-8000-000000000001"
@@ -94,6 +97,7 @@ class FakeStore:
         self.errors_set = 0
         self.fail_on: str | None = None
         self.rebuild_env_honoured = False
+        self.purge_enabled = False
 
     def _fresh(self) -> None:
         self.uuid: str | None = None
@@ -109,6 +113,7 @@ class FakeStore:
         self.source_block: int | None = None
         self.source_time: datetime | None = None
         self.resets = 0
+        self.purge_queue: dict[str, dict[str, Any]] = {}
 
     def load(self) -> Any:
         return sync.State(self.uuid, self.version, dict(self.cursors), self.bootstrap_complete,
@@ -127,10 +132,13 @@ class FakeStore:
     def set_rebuild_env_honoured(self, honoured: bool) -> None:
         self.rebuild_env_honoured = honoured
 
-    def apply_page(self, stream: Any, rows: list[dict[str, Any]], cursor: Any) -> None:
+    def apply_page(self, stream: Any, rows: list[dict[str, Any]], cursor: Any, enqueue_purges: bool = False) -> int:
         if self.fail_on == stream.name:
             raise sync.SyncError("replica database: constraint violation")
+        queued = 0
         for r in rows:
+            if stream is sync.PROFILES and enqueue_purges:
+                queued += self._enqueue(r)
             if stream is sync.ACCOUNTS:
                 self.accounts[r["name"]] = r["hive_id"]
             elif stream is sync.URLS:
@@ -144,6 +152,37 @@ class FakeStore:
                 self.pending.discard(key)
                 self.url_authors.add(key)
         self.cursors[stream.name] = cursor
+        return queued
+
+    def _enqueue(self, r: dict[str, Any]) -> int:
+        old_avatar, old_cover, _ = self.profiles.get(r["account_name"], (None, None, None))
+        avatar, cover = r["avatar_url"] != old_avatar, r["cover_url"] != old_cover
+        if not (avatar or cover):
+            return 0
+        q = self.purge_queue.setdefault(r["account_name"], {"block": r["updated_block"], "avatar_changed": False,
+                                                            "cover_changed": False, "attempts": 0, "last_error": None})
+        q["block"] = max(q["block"], r["updated_block"])
+        q["avatar_changed"] |= avatar
+        q["cover_changed"] |= cover
+        return 1
+
+    def pending_purges(self, limit: int) -> list[Any]:
+        items = [purge.PurgeItem(name, q["block"], q["avatar_changed"], q["cover_changed"])
+                 for name, q in self.purge_queue.items()]
+        return sorted(items, key=lambda i: (i.block, i.account_name))[:limit]
+
+    def purges_done(self, items: list[Any]) -> None:
+        for i in items:
+            if self.purge_queue.get(i.account_name, {}).get("block") == i.block:
+                del self.purge_queue[i.account_name]
+
+    def purges_failed(self, items: list[Any], error: str) -> None:
+        for i in items:
+            self.purge_queue[i.account_name]["attempts"] += 1
+            self.purge_queue[i.account_name]["last_error"] = error
+
+    def set_purge_enabled(self, enabled: bool) -> None:
+        self.purge_enabled = enabled
 
     def replace_blacklists(self, urls: list[str], accounts: list[str]) -> None:
         self.blacklist = (urls, accounts)
@@ -630,3 +669,312 @@ def test_an_undecodable_gzip_page_is_a_sync_error_with_its_stream_and_cursor_and
         sync.run(syncer(sync.HttpSource(SOURCE_URL), store), 5, once=False, sleep=sleep)
     assert sleeps == [sync.RETRY_SLEEP_S, 5]
     assert store.error is None and len(store.urls) == 2
+
+
+CF_API = "https://cf.invalid/client/v4"
+ZONE, TOKEN, BASE = "zone-1", "secret-token-value", "https://images.invalid"
+AVATAR_PATHS = ["avatar", "avatar/small", "avatar/medium", "avatar/large"]
+
+
+def avatar_urls(name: str) -> set[str]:
+    return {f"{BASE}{prefix}/u/{name}/{p}" for prefix in ("", "/webp") for p in AVATAR_PATHS}
+
+
+def cover_urls(name: str) -> set[str]:
+    return {f"{BASE}/u/{name}/cover", f"{BASE}/webp/u/{name}/cover"}
+
+
+class Cloudflare:
+    """Cloudflare's purge_cache answering CloudflareClient's urllib requests, and its call log.
+
+    answers are consumed one per call: an exception is raised, an int is the HTTP status
+    (429 with Retry-After: retry_after); with none left a call succeeds. Each call records
+    its files and the store's queue and profiles as they were when it arrived."""
+
+    def __init__(self, store: FakeStore) -> None:
+        self.store = store
+        self.calls: list[dict[str, Any]] = []
+        self.answers: list[Any] = []
+        self.retry_after = "7"
+
+    def urlopen(self, req: urllib.request.Request, timeout: float) -> Response:
+        assert req.full_url == f"{CF_API}/zones/{ZONE}/purge_cache" and req.get_method() == "POST"
+        assert req.get_header("Authorization") == f"Bearer {TOKEN}"
+        assert isinstance(req.data, bytes)
+        self.calls.append({"files": json.loads(req.data)["files"],
+                           "queue": {k: dict(v) for k, v in self.store.purge_queue.items()},
+                           "profiles": dict(self.store.profiles)})
+        answer = self.answers.pop(0) if self.answers else 200
+        if isinstance(answer, Exception):
+            raise answer
+        if answer != 200:
+            headers = email.message.Message()
+            if answer == 429:
+                headers["Retry-After"] = self.retry_after
+            raise urllib.error.HTTPError(req.full_url, answer, "error", headers, io.BytesIO(b'{"success":false}'))
+        return Response(b'{"success":true,"errors":[],"messages":[],"result":{"id":"x"}}', {})
+
+    def files(self, call: int = -1) -> set[str]:
+        return set(self.calls[call]["files"])
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock() -> Clock:
+    return Clock()
+
+
+def purge_config(**kwargs: Any) -> Any:
+    return purge.PurgeConfig(zone=ZONE, token=TOKEN, base_url=BASE, api_url=CF_API, **kwargs)
+
+
+def purging(monkeypatch: pytest.MonkeyPatch, store: FakeStore, clock: Clock, **kwargs: Any) -> tuple[Any, Cloudflare]:
+    cloudflare = Cloudflare(store)
+    monkeypatch.setattr(purge.urllib.request, "urlopen", cloudflare.urlopen)
+    config = purge_config(**kwargs)
+    return purge.Purger(config, purge.CloudflareClient(config), store, clock), cloudflare
+
+
+def bootstrapped(monkeypatch: pytest.MonkeyPatch, clock: Clock) -> tuple[FakeSource, FakeStore, Any, Cloudflare]:
+    source, store = seeded_source(), FakeStore()
+    purger, cloudflare = purging(monkeypatch, store, clock)
+    s = syncer(source, store, purger=purger)
+    s.cycle()
+    assert store.bootstrap_complete and store.profiles and store.purge_queue == {} and cloudflare.calls == [], \
+        "the bootstrap's profiles are not purged"
+    assert store.purge_enabled
+    return source, store, s, cloudflare
+
+
+def queued(block: int, avatar: bool, cover: bool, attempts: int = 0, error: str | None = None) -> dict[str, Any]:
+    return {"block": block, "avatar_changed": avatar, "cover_changed": cover, "attempts": attempts, "last_error": error}
+
+
+def test_a_changed_avatar_is_queued_with_the_profile_and_purged_after_it_is_applied(
+        monkeypatch: pytest.MonkeyPatch, clock: Clock) -> None:
+    source, store, s, cloudflare = bootstrapped(monkeypatch, clock)
+    source.head = 21
+    source.set_profile("alice", "https://a.invalid/avatar2.png", None, 21)
+    s.cycle()
+
+    assert len(cloudflare.calls) == 1
+    assert sorted(cloudflare.calls[0]["files"]) == sorted(avatar_urls("alice"))
+    assert cloudflare.calls[0]["queue"] == {"alice": queued(21, True, False)}
+    assert cloudflare.calls[0]["profiles"]["alice"][0] == "https://a.invalid/avatar2.png", \
+        "the purge follows the applied profile"
+    assert store.purge_queue == {} and store.error is None
+
+
+def test_a_profile_row_with_the_same_urls_is_not_queued_or_purged(
+        monkeypatch: pytest.MonkeyPatch, clock: Clock) -> None:
+    source, store, s, cloudflare = bootstrapped(monkeypatch, clock)
+    source.head = 21
+    source.set_profile("alice", "https://a.invalid/avatar.png", None, 21)
+    s.cycle()
+
+    assert store.profiles["alice"] == ("https://a.invalid/avatar.png", None, 21)
+    assert store.purge_queue == {} and cloudflare.calls == []
+
+
+@pytest.mark.parametrize("change, expected", [
+    (("alice", None, None), avatar_urls("alice")),
+    (("alice", "https://a.invalid/avatar.png", "https://a.invalid/cover.png"), cover_urls("alice")),
+    (("bob", "https://a.invalid/bob.png", None), avatar_urls("bob")),
+], ids=["avatar-removed", "cover-set", "first-profile"])
+def test_a_url_set_or_removed_purges_exactly_what_changed(
+        monkeypatch: pytest.MonkeyPatch, clock: Clock, change: tuple[str, Any, Any], expected: set[str]) -> None:
+    source, store, s, cloudflare = bootstrapped(monkeypatch, clock)
+    source.head = 21
+    source.set_profile(*change, 21)
+    s.cycle()
+
+    assert len(cloudflare.calls) == 1 and cloudflare.files() == expected
+    assert store.purge_queue == {}
+
+
+@pytest.mark.parametrize("restart", [{"rebuild": True}, {"reset": True}], ids=["rebuild", "reset"])
+def test_rebuild_and_reset_empty_the_queue_and_purge_nothing_they_apply(
+        monkeypatch: pytest.MonkeyPatch, clock: Clock, restart: dict[str, bool]) -> None:
+    source, store, s, cloudflare = bootstrapped(monkeypatch, clock)
+    cloudflare.answers = [http_error(503)]
+    source.head = 21
+    source.set_profile("alice", "https://a.invalid/avatar2.png", None, 21)
+    s.cycle()
+    assert set(store.purge_queue) == {"alice"}
+    if restart.get("reset"):
+        source.uuid = OTHER_UUID
+    source.set_profile("bob", "https://a.invalid/bob.png", None, 21)
+    calls = len(cloudflare.calls)
+    clock.now += 3600
+    config = purge_config()
+
+    restarted = syncer(source, store, purger=purge.Purger(config, purge.CloudflareClient(config), store, clock), **restart)
+    assert sync.run(restarted, 5, once=True) == 0
+    assert store.resets == 1 and store.bootstrap_complete and store.purge_enabled
+    assert store.profiles["bob"][0] == "https://a.invalid/bob.png"
+    assert store.purge_queue == {} and len(cloudflare.calls) == calls
+
+
+@pytest.mark.parametrize("failure", [lambda: http_error(503), lambda: urllib.error.URLError(ConnectionRefusedError()),
+                                     lambda: purge.http.client.IncompleteRead(b"{"), lambda: 429],
+                         ids=["503", "connection-refused", "truncated-answer", "429"])
+def test_a_failed_purge_keeps_the_rows_and_sync_goes_on_until_a_later_drain_purges_them(
+        monkeypatch: pytest.MonkeyPatch, clock: Clock, failure: Any) -> None:
+    source, store, s, cloudflare = bootstrapped(monkeypatch, clock)
+    cloudflare.answers = [failure()]
+    source.head = 21
+    source.set_profile("alice", "https://a.invalid/avatar2.png", None, 21)
+    assert sync.run(s, 5, once=True) == 0
+
+    assert len(cloudflare.calls) == 1, "the drain stops at the failed call, the end-of-cycle drain waits"
+    assert store.purge_queue["alice"]["attempts"] == 1 and store.purge_queue["alice"]["last_error"]
+    assert store.error is None and store.source_block == 21
+
+    source.head = 22
+    source.add_url("https://a.invalid/later.png", "carol", 3, 22)
+    s.cycle()
+    assert store.cursors["urls"] == sync.Cursor(22) and store.error is None
+    assert len(cloudflare.calls) == 1, "still within the purge backoff"
+
+    clock.now += 7
+    source.head = 23
+    s.cycle()
+    assert len(cloudflare.calls) == 2 and cloudflare.files() == avatar_urls("alice")
+    assert store.purge_queue == {} and store.error is None
+
+
+def test_the_purge_backoff_doubles_up_to_its_cap_and_a_429_waits_its_retry_after(
+        monkeypatch: pytest.MonkeyPatch, clock: Clock) -> None:
+    store = FakeStore()
+    purger, cloudflare = purging(monkeypatch, store, clock)
+    store.purge_queue["alice"] = queued(5, True, False)
+    cloudflare.answers = [http_error(503) for _ in range(9)] + [429]
+    times = []
+    while len(cloudflare.calls) < 10:
+        calls = len(cloudflare.calls)
+        purger.drain()
+        if len(cloudflare.calls) > calls:
+            times.append(clock.now)
+        clock.now += 1
+    assert [b - a for a, b in zip(times, times[1:])] == [3, 6, 12, 24, 48, 96, 192, 300, 300]
+    assert store.purge_queue["alice"]["attempts"] == 10 and "HTTP 429" in store.purge_queue["alice"]["last_error"]
+
+    clock.now = times[-1] + 6.9
+    purger.drain()
+    assert len(cloudflare.calls) == 10, "Retry-After: 7 is honoured"
+    clock.now = times[-1] + 7
+    purger.drain()
+    assert len(cloudflare.calls) == 11 and store.purge_queue == {}
+
+
+def test_two_changes_before_the_purge_are_one_row_and_one_purge(
+        monkeypatch: pytest.MonkeyPatch, clock: Clock) -> None:
+    source, store, s, cloudflare = bootstrapped(monkeypatch, clock)
+    cloudflare.answers = [http_error(503)]
+    source.head = 21
+    source.set_profile("alice", "https://a.invalid/avatar2.png", None, 21)
+    s.cycle()
+    error = store.purge_queue["alice"]["last_error"]
+    source.head = 22
+    source.set_profile("alice", "https://a.invalid/avatar2.png", "https://a.invalid/cover2.png", 22)
+    s.cycle()
+    assert store.purge_queue == {"alice": queued(22, True, True, 1, error)}
+
+    clock.now += 3
+    s.cycle()
+    assert len(cloudflare.calls) == 2
+    assert cloudflare.files() == avatar_urls("alice") | cover_urls("alice")
+    assert store.purge_queue == {}
+
+
+def test_a_drain_sends_at_most_30_urls_per_call_and_stops_at_its_time_budget(
+        monkeypatch: pytest.MonkeyPatch, clock: Clock) -> None:
+    store = FakeStore()
+    purger, cloudflare = purging(monkeypatch, store, clock, time_budget_s=5)
+    for i in range(10):
+        store.purge_queue[f"user{i}"] = queued(i, True, True)
+    urlopen = cloudflare.urlopen
+
+    def slow_urlopen(req: urllib.request.Request, timeout: float) -> Response:
+        clock.now += 2
+        return urlopen(req, timeout)
+    monkeypatch.setattr(purge.urllib.request, "urlopen", slow_urlopen)
+    purger.drain()
+
+    assert [len(c["files"]) for c in cloudflare.calls] == [30, 30, 30]
+    assert cloudflare.files(0) == set().union(*(avatar_urls(f"user{i}") | cover_urls(f"user{i}") for i in range(3)))
+    assert sorted(store.purge_queue) == ["user9"]
+    purger.drain()
+    assert store.purge_queue == {} and [len(c["files"]) for c in cloudflare.calls] == [30, 30, 30, 10]
+
+
+def test_url_templates_override_the_default_list() -> None:
+    config = purge.PurgeConfig.from_env({
+        "PURGE_CLOUDFLARE_ZONE": ZONE, "PURGE_CLOUDFLARE_TOKEN": TOKEN, "PURGE_BASE_URL": BASE + "/",
+        "PURGE_URL_TEMPLATES": "{base}/u/{name}/avatar, https://other.invalid/{name}/cover",
+        "PURGE_TIME_BUDGET_S": "2.5"})
+    assert config is not None and config.time_budget_s == 2.5
+    assert config.urls(purge.PurgeItem("alice", 1, True, True)) == \
+        [f"{BASE}/u/alice/avatar", "https://other.invalid/alice/cover"]
+    assert config.urls(purge.PurgeItem("alice", 1, False, True)) == ["https://other.invalid/alice/cover"]
+    with pytest.raises(ValueError, match="exactly one of"):
+        purge_config(url_templates=("{base}/u/{name}/profile",))
+
+
+def set_env(monkeypatch: pytest.MonkeyPatch, **env: str) -> None:
+    for name in ("PURGE_CLOUDFLARE_ZONE", "PURGE_CLOUDFLARE_TOKEN", "PURGE_BASE_URL", "PURGE_URL_TEMPLATES",
+                 "PURGE_TIME_BUDGET_S", "PURGE_CLOUDFLARE_API_URL"):
+        monkeypatch.delenv(name, raising=False)
+    env = {"PROXY_WHITELIST_SOURCE_URL": SOURCE_URL, "POSTGRES_URL": "postgresql://replica.invalid/proxy_whitelist",
+           **env}
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_purging_without_its_full_configuration_is_off_queues_nothing_and_is_logged_at_start(
+        http: HttpFixture, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    store = FakeStore()
+    monkeypatch.setattr(sync, "PgStore", lambda url: store)
+    set_env(monkeypatch, PURGE_CLOUDFLARE_ZONE=ZONE, PURGE_CLOUDFLARE_TOKEN=TOKEN)
+    with caplog.at_level(logging.INFO, logger="proxy_whitelist_replica"):
+        assert sync.main(["--once"]) == 0
+        http.source.head = 21
+        http.source.set_profile("alice", "https://a.invalid/avatar2.png", None, 21)
+        assert sync.main(["--once"]) == 0
+
+    assert store.bootstrap_complete and store.profiles["alice"][0] == "https://a.invalid/avatar2.png"
+    assert store.purge_queue == {} and not store.purge_enabled
+    assert sum("Cloudflare purging is off" in r.getMessage() for r in caplog.records) == 2, "once per start"
+    assert TOKEN not in caplog.text
+
+
+def test_purging_configured_from_the_environment_purges_and_never_logs_the_token(
+        http: HttpFixture, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    store = FakeStore()
+    syncer(http.source, store).cycle()
+    cloudflare = Cloudflare(store)
+    cloudflare.answers = [429]
+    monkeypatch.setattr(sync.urllib.request, "urlopen", lambda req, timeout: (
+        cloudflare if req.full_url.startswith(CF_API) else http).urlopen(req, timeout))
+    monkeypatch.setattr(sync, "PgStore", lambda url: store)
+    set_env(monkeypatch, PURGE_CLOUDFLARE_ZONE=ZONE, PURGE_CLOUDFLARE_TOKEN=TOKEN, PURGE_BASE_URL=BASE,
+            PURGE_CLOUDFLARE_API_URL=CF_API)
+    http.source.head = 21
+    http.source.set_profile("alice", "https://a.invalid/avatar2.png", None, 21)
+    with caplog.at_level(logging.DEBUG, logger="proxy_whitelist_replica"):
+        assert sync.main(["--once"]) == 0
+    assert store.purge_enabled and store.error is None
+    assert len(cloudflare.calls) == 1 and "HTTP 429" in store.purge_queue["alice"]["last_error"]
+    assert "retrying in 7.0 s" in caplog.text and "Cloudflare purging is on" in caplog.text
+
+    with caplog.at_level(logging.DEBUG, logger="proxy_whitelist_replica"):
+        assert sync.main(["--once"]) == 0
+    assert len(cloudflare.calls) == 2 and cloudflare.files() == avatar_urls("alice") and store.purge_queue == {}
+    assert TOKEN not in caplog.text

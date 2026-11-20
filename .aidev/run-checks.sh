@@ -33,18 +33,21 @@
 #   - replica-install replica/install.sh into a fresh database on the stack's plain
 #                     Postgres (PROXY_WHITELIST_TEST_REPLICA_DB_HOST, default
 #                     `replica-db`), twice; then the replicated tables, the state
-#                     row and the endpoint functions exist and the stream ones do not
+#                     row and the endpoint functions exist and the stream ones do not;
+#                     a third time over a state without the purge outbox, which
+#                     it adds, with sync_status()'s purge fields
 #   - replica-sync    .aidev/replica_smoke.py sync: replica/sync.py --once against
 #                     the installed primary served as api-smoke serves it, until
 #                     bootstrap_complete with the primary's counts
 #   - replica-smoke   .aidev/replica_smoke.py smoke: the primary seeded and followed
 #                     cycle by cycle (paging, new and quiet blocks, a pending url
 #                     author, an unreachable source, a changed sync_uuid and
-#                     --reset, --rebuild), the replica's answers compared byte for byte
+#                     --reset, --rebuild, Cloudflare purging against a stub), the
+#                     replica's answers compared byte for byte
 #   - replica-health  .aidev/replica_smoke.py health: the replica rebuilt from the
 #                     primary, then replica/healthcheck/proxy_whitelist_replica.sh
 #                     (haproxy's agent check) up in sync, down when stale,
-#                     unbootstrapped or PostgREST not live
+#                     unbootstrapped or PostgREST not live, up with a purge backlog
 #
 # Reports go to test-results/<suite>/: junit.xml (one case per step) plus one log
 # per step, and the per-call junit of api-smoke.
@@ -195,6 +198,16 @@ replica_install() {
         || { echo "check_url(text, text[]) is not installed"; return 1; }
     [ "$(replica_query "select count(*) from pg_proc where proname like 'stream\_%'")" = 0 ] \
         || { echo "stream functions installed on the replica"; return 1; }
+    # A replica installed before the purge outbox gains it on the next install.
+    replica_query "alter table proxy_whitelist_replica.state drop column purge_enabled;
+                   drop table proxy_whitelist_replica.purge_queue" > /dev/null || return 1
+    bash replica/install.sh --postgres-url="$REPLICA_ADMIN_URL" || return 1
+    [ "$(replica_query "select to_regclass('proxy_whitelist_replica.purge_queue') is not null")" = t ] \
+        || { echo "no proxy_whitelist_replica.purge_queue"; return 1; }
+    [ "$(replica_query "select (s::jsonb ?& array['purge_enabled', 'purge_pending', 'purge_oldest_block', 'purge_last_error'])
+                        and s->>'purge_enabled' = 'false' and s->>'purge_pending' = '0'
+                        from proxy_whitelist_endpoints.sync_status() s")" = t ] \
+        || { echo "sync_status() lacks the purge fields of an empty, disabled queue"; return 1; }
     [ "$(replica_query "select proxy_whitelist_endpoints.sync_status()->>'bootstrap_complete'")" = false ] \
         || { echo "sync_status() of a fresh replica is not bootstrap_complete = false"; return 1; }
     [ "$(replica_query "select (s->>'sync_uuid') is not null and s->>'source_sync_uuid' is null

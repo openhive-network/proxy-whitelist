@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS proxy_whitelist_replica.pending_url_authors (
  * replica's own identity, minted with the row, so anew by every reset or
  * rebuild. rebuild_env_honoured records that a rebuild was done for
  * PROXY_WHITELIST_REPLICA_REBUILD=1, so later starts with it still set skip it.
+ * purge_enabled is whether the running syncer purges Cloudflare (replica/purge.py).
  */
 CREATE TABLE IF NOT EXISTS proxy_whitelist_replica.state (
   id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
@@ -106,13 +107,34 @@ CREATE TABLE IF NOT EXISTS proxy_whitelist_replica.state (
   sync_error TEXT NULL,
   bootstrap_complete BOOLEAN NOT NULL DEFAULT FALSE,
   replica_sync_uuid UUID NOT NULL DEFAULT gen_random_uuid(),
-  rebuild_env_honoured BOOLEAN NOT NULL DEFAULT FALSE
+  rebuild_env_honoured BOOLEAN NOT NULL DEFAULT FALSE,
+  purge_enabled BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 -- Columns added after the first release, for replicas installed before them.
 ALTER TABLE proxy_whitelist_replica.state
 ADD COLUMN IF NOT EXISTS replica_sync_uuid UUID NOT NULL DEFAULT gen_random_uuid(),
-ADD COLUMN IF NOT EXISTS rebuild_env_honoured BOOLEAN NOT NULL DEFAULT FALSE;
+ADD COLUMN IF NOT EXISTS rebuild_env_honoured BOOLEAN NOT NULL DEFAULT FALSE,
+ADD COLUMN IF NOT EXISTS purge_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+
+/*
+ * The outbox of Cloudflare purges (replica/purge.py): an account whose
+ * avatar_url or cover_url changed, written in the transaction that applied the
+ * change, deleted once its redirect URLs are purged. A second change before
+ * the purge raises block and ORs the flags. attempts/last_error record failed
+ * purge calls.
+ */
+CREATE TABLE IF NOT EXISTS proxy_whitelist_replica.purge_queue (
+  account_name TEXT PRIMARY KEY,
+  block INT NOT NULL,
+  avatar_changed BOOLEAN NOT NULL,
+  cover_changed BOOLEAN NOT NULL,
+  queued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  attempts INT NOT NULL DEFAULT 0,
+  last_error TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS purge_queue_by_block
+ON proxy_whitelist_replica.purge_queue (block, account_name);
 
 INSERT INTO proxy_whitelist_replica.state (id) VALUES (TRUE)
 ON CONFLICT (id) DO NOTHING;

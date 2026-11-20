@@ -13,6 +13,10 @@ Configuration (environment):
   PROXY_WHITELIST_REPLICA_REBUILD  1 to act as --rebuild once: the replica records that it
                                    rebuilt for it and ignores it on later starts until it has
                                    been seen unset
+  PURGE_CLOUDFLARE_ZONE, PURGE_CLOUDFLARE_TOKEN, PURGE_BASE_URL, PURGE_URL_TEMPLATES,
+  PURGE_TIME_BUDGET_S, PURGE_CLOUDFLARE_API_URL
+                                   Cloudflare invalidation of the avatar/cover redirects
+                                   (replica/purge.py); off unless the first three are set
 
 One cycle reads the source's /sync-status, checks the source identity
 (sync_uuid, stream_schema_version) against the one stored on first contact,
@@ -31,6 +35,13 @@ not the identity changed. A page the source path gives up on (HTTP 502/504, a
 timeout) is retried at once with half the stream's page size, down to
 MIN_PAGE_SIZE. Other failures set sync_error and are retried with a backoff of
 3 s doubling to 60 s (--once: exit 1).
+
+With purging on, a profile page whose rows change an account's avatar_url or
+cover_url enqueues the account into proxy_whitelist_replica.purge_queue in the
+page's transaction, unless the cycle started before bootstrap_complete (a
+bootstrap, --reset or --rebuild purges nothing). The queue is drained after
+every page that enqueued and at the end of every cycle; a drain failure is
+logged and left to the purger's own backoff, never to sync_error.
 """
 import argparse
 import gzip
@@ -50,6 +61,8 @@ from typing import Any, Callable, Protocol, TypeVar
 
 import psycopg
 from psycopg import sql
+
+from purge import CloudflareClient, PurgeConfig, PurgeItem, Purger
 
 STREAM_SCHEMA_VERSION = 2
 # The source's stream_page_cap(): a larger page_size would be served capped,
@@ -148,10 +161,12 @@ class Store(Protocol):
     def adopt_source(self, source_url: str, status: SourceStatus) -> None: ...
     def reset(self, source_url: str, status: SourceStatus, rebuild_env_honoured: bool) -> None: ...
     def set_rebuild_env_honoured(self, honoured: bool) -> None: ...
-    def apply_page(self, stream: Stream, rows: list[dict[str, Any]], cursor: Cursor) -> None: ...
+    def apply_page(self, stream: Stream, rows: list[dict[str, Any]], cursor: Cursor,
+                   enqueue_purges: bool = False) -> int: ...
     def replace_blacklists(self, urls: list[str], accounts: list[str]) -> None: ...
     def finish_cycle(self, source_url: str, status: SourceStatus) -> None: ...
     def set_error(self, message: str) -> None: ...
+    def set_purge_enabled(self, enabled: bool) -> None: ...
 
 
 def _parse_block_time(value: str | None) -> datetime | None:
@@ -255,10 +270,11 @@ class Syncer:
 
     rebuild truncates the replica before the first cycle; rebuild_from_env does
     the same unless the store records that it already did so for the environment
-    variable, and when the variable is unset the record is cleared."""
+    variable, and when the variable is unset the record is cleared. With a purger,
+    profile changes applied after the bootstrap are enqueued and drained by it."""
 
     def __init__(self, source: Source, store: Store, source_url: str, page_size: int, reset: bool,
-                 rebuild: bool = False, rebuild_from_env: bool = False) -> None:
+                 rebuild: bool = False, rebuild_from_env: bool = False, purger: Purger | None = None) -> None:
         if not 1 <= page_size <= MAX_PAGE_SIZE:
             raise ValueError(f"page size must be within [1, {MAX_PAGE_SIZE}], got {page_size}")
         self.source = source
@@ -270,19 +286,33 @@ class Syncer:
         self._rebuild_from_env = rebuild_from_env
         self._rebuild_checked = False
         self._page_sizes = {stream.name: page_size for stream in STREAMS}
+        self._purger = purger
+        self._purge_enabled_recorded = False
 
     def cycle(self) -> SourceStatus:
         """Replicates the source up to its current last_block_num; returns the status it reached."""
-        status = self.source.status()
-        state = self._checked_state(status)
-        for stream in STREAMS:
-            self._follow(stream, state.cursors[stream.name], status)
-        urls, accounts = self.source.blacklists()
-        self.store.replace_blacklists(urls, accounts)
-        self.store.finish_cycle(self.source_url, status)
-        if not state.bootstrap_complete:
-            log.info("bootstrap complete at block %s", status.block_num)
-        return status
+        try:
+            status = self.source.status()
+            state = self._checked_state(status)
+            enqueue = self._purger is not None and state.bootstrap_complete
+            for stream in STREAMS:
+                self._follow(stream, state.cursors[stream.name], status, enqueue)
+            urls, accounts = self.source.blacklists()
+            self.store.replace_blacklists(urls, accounts)
+            self.store.finish_cycle(self.source_url, status)
+            if not state.bootstrap_complete:
+                log.info("bootstrap complete at block %s", status.block_num)
+            return status
+        finally:
+            self._drain_purges()
+
+    def _drain_purges(self) -> None:
+        if self._purger is None:
+            return
+        try:
+            self._purger.drain()
+        except SyncError as err:
+            log.warning("purge queue: %s; draining again next cycle", err)
 
     def _checked_state(self, status: SourceStatus) -> State:
         if status.stream_schema_version != STREAM_SCHEMA_VERSION:
@@ -290,6 +320,9 @@ class Syncer:
                 f"the source serves stream_schema_version {status.stream_schema_version}, "
                 f"this syncer reads {STREAM_SCHEMA_VERSION}")
         state = self.store.load()
+        if not self._purge_enabled_recorded:
+            self.store.set_purge_enabled(self._purger is not None)
+            self._purge_enabled_recorded = True
         if not self._rebuild_checked:
             state = self._rebuilt(state, status)
         if state.sync_uuid is None:
@@ -322,7 +355,7 @@ class Syncer:
         self._rebuild_checked = True
         return state
 
-    def _follow(self, stream: Stream, cursor: Cursor, status: SourceStatus) -> None:
+    def _follow(self, stream: Stream, cursor: Cursor, status: SourceStatus, enqueue_purges: bool) -> None:
         target = status.block_num
         if cursor.block > target:
             raise SyncError(f"{stream.name}: the source's last_block_num {target} is below the replicated block {cursor}")
@@ -334,7 +367,7 @@ class Syncer:
             if from_block > target:
                 return
             try:
-                cursor = self._apply_next(stream, from_block, after, target, status.sync_uuid)
+                cursor = self._apply_next(stream, from_block, after, target, status.sync_uuid, enqueue_purges)
             except IdentityMismatch:
                 raise
             except SourceTimeout as err:
@@ -354,7 +387,7 @@ class Syncer:
         return True
 
     def _apply_next(self, stream: Stream, from_block: int, after: dict[str, str],
-                    target: int, sync_uuid: str) -> Cursor:
+                    target: int, sync_uuid: str, enqueue_purges: bool) -> Cursor:
         page_size = self._page_sizes[stream.name]
         page = self.source.page(stream, from_block, target, after, page_size)
         if page.sync_uuid != sync_uuid:
@@ -371,8 +404,11 @@ class Syncer:
             if page.to_block != target:
                 raise SyncError(f"short page with Stream-To-Block {page.to_block}, requested up to {target}")
             cursor = Cursor(page.to_block)
-        self.store.apply_page(stream, rows, cursor)
+        queued = self.store.apply_page(stream, rows, cursor, enqueue_purges)
         log.debug("%s: %d rows, cursor %s", stream.name, len(rows), cursor)
+        if queued:
+            log.info("%s: %d accounts queued for purging", stream.name, queued)
+            self._drain_purges()
         if page_size != self.page_size:
             log.info("%s: page_size %d passed; back to %d", stream.name, page_size, self.page_size)
             self._page_sizes[stream.name] = self.page_size
@@ -386,13 +422,13 @@ class PgStore:
         "proxy_whitelist_app.blacklisted_urls", "proxy_whitelist_app.blacklisted_accounts",
         "proxy_whitelist_app.account_profiles", "proxy_whitelist_app.url_authors",
         "proxy_whitelist_app.urls", "proxy_whitelist_app.accounts",
-        "proxy_whitelist_replica.pending_url_authors",
+        "proxy_whitelist_replica.pending_url_authors", "proxy_whitelist_replica.purge_queue",
     )
 
     def __init__(self, postgres_url: str) -> None:
         self._url = postgres_url
         self._conn: psycopg.Connection | None = None
-        self._apply: dict[str, Callable[[psycopg.Cursor, list[dict[str, Any]]], None]] = {
+        self._apply: dict[str, Callable[[psycopg.Cursor, list[dict[str, Any]], bool], int]] = {
             ACCOUNTS.name: self._apply_accounts,
             URLS.name: self._apply_urls,
             URL_AUTHORS.name: self._apply_url_authors,
@@ -449,9 +485,10 @@ class PgStore:
             cur.execute(sql.SQL("TRUNCATE {} RESTART IDENTITY").format(
                 sql.SQL(", ").join(sql.SQL(t) for t in self._REPLICATED_TABLES)))
             # A new state row: fresh cursors, bootstrap_complete false and a newly minted replica_sync_uuid.
-            cur.execute("DELETE FROM proxy_whitelist_replica.state")
-            cur.execute("INSERT INTO proxy_whitelist_replica.state (id, rebuild_env_honoured) VALUES (TRUE, %s)",
-                        (rebuild_env_honoured,))
+            cur.execute("DELETE FROM proxy_whitelist_replica.state RETURNING purge_enabled")
+            row = cur.fetchone()
+            cur.execute("INSERT INTO proxy_whitelist_replica.state (id, rebuild_env_honoured, purge_enabled) "
+                        "VALUES (TRUE, %s, %s)", (rebuild_env_honoured, row is not None and row[0]))
             self._set_identity(cur, source_url, status)
         self._transaction(work)
 
@@ -459,17 +496,19 @@ class PgStore:
         self._transaction(lambda cur: cur.execute(
             "UPDATE proxy_whitelist_replica.state SET rebuild_env_honoured = %s", (honoured,)))
 
-    def apply_page(self, stream: Stream, rows: list[dict[str, Any]], cursor: Cursor) -> None:
+    def apply_page(self, stream: Stream, rows: list[dict[str, Any]], cursor: Cursor,
+                   enqueue_purges: bool = False) -> int:
+        """Applies rows and cursor in one transaction; returns how many accounts it queued for purging."""
         columns = [f"{stream.name}_block"] + [f"{stream.name}_{p}" for p in stream.after_params]
         values = [cursor.block] + list(cursor.key or (None,) * len(stream.after_params))
         update = sql.SQL("UPDATE proxy_whitelist_replica.state SET {}").format(
             sql.SQL(", ").join(sql.SQL("{} = %s").format(sql.Identifier(c)) for c in columns))
 
-        def work(cur: psycopg.Cursor) -> None:
-            if rows:
-                self._apply[stream.name](cur, rows)
+        def work(cur: psycopg.Cursor) -> int:
+            queued = self._apply[stream.name](cur, rows, enqueue_purges) if rows else 0
             cur.execute(update, values)
-        self._transaction(work)
+            return queued
+        return self._transaction(work)
 
     @staticmethod
     def _resolve_pending(cur: psycopg.Cursor) -> None:
@@ -484,15 +523,16 @@ class PgStore:
             SELECT url_id, author_id, first_block FROM resolved
             ON CONFLICT DO NOTHING""")
 
-    def _apply_accounts(self, cur: psycopg.Cursor, rows: list[dict[str, Any]]) -> None:
+    def _apply_accounts(self, cur: psycopg.Cursor, rows: list[dict[str, Any]], _enqueue_purges: bool) -> int:
         cur.execute("""
             INSERT INTO proxy_whitelist_app.accounts (hive_id, name, first_block)
             SELECT * FROM unnest(%s::INT[], %s::TEXT[], %s::INT[])
             ON CONFLICT (hive_id) DO UPDATE SET name = EXCLUDED.name""",
                     ([r["hive_id"] for r in rows], [r["name"] for r in rows], [r["first_block"] for r in rows]))
         self._resolve_pending(cur)
+        return 0
 
-    def _apply_urls(self, cur: psycopg.Cursor, rows: list[dict[str, Any]]) -> None:
+    def _apply_urls(self, cur: psycopg.Cursor, rows: list[dict[str, Any]], _enqueue_purges: bool) -> int:
         for r in rows:
             if hashlib.md5(r["url"].encode()).hexdigest() != r["md5"]:
                 raise SyncError(f"url row whose md5 {r['md5']} does not match its url {r['url']!r}")
@@ -502,9 +542,10 @@ class PgStore:
             ON CONFLICT ((md5(url))) DO NOTHING""",
                     ([r["url"] for r in rows], [r["first_block"] for r in rows]))
         self._resolve_pending(cur)
+        return 0
 
     @staticmethod
-    def _apply_url_authors(cur: psycopg.Cursor, rows: list[dict[str, Any]]) -> None:
+    def _apply_url_authors(cur: psycopg.Cursor, rows: list[dict[str, Any]], _enqueue_purges: bool) -> int:
         cur.execute("""
             WITH input AS (
                 SELECT * FROM unnest(%s::TEXT[], %s::TEXT[], %s::INT[]) AS i (url_md5, account_name, first_block)
@@ -526,22 +567,56 @@ class PgStore:
             WHERE url_id IS NULL OR author_id IS NULL
             ON CONFLICT DO NOTHING""",
                     ([r["url_md5"] for r in rows], [r["account_name"] for r in rows], [r["first_block"] for r in rows]))
+        return 0
 
     @staticmethod
-    def _apply_profiles(cur: psycopg.Cursor, rows: list[dict[str, Any]]) -> None:
+    def _apply_profiles(cur: psycopg.Cursor, rows: list[dict[str, Any]], enqueue_purges: bool) -> int:
+        # Every sub-statement sees the snapshot before the upsert, so `old` holds the previous urls.
         cur.execute("""
-            INSERT INTO proxy_whitelist_app.account_profiles (account_id, avatar_url, cover_url, updated_block)
-            SELECT a.id, i.avatar_url, i.cover_url, i.updated_block
-            FROM unnest(%s::TEXT[], %s::TEXT[], %s::TEXT[], %s::INT[]) AS i (account_name, avatar_url, cover_url, updated_block)
-            JOIN proxy_whitelist_app.accounts a ON a.name = i.account_name
-            ON CONFLICT (account_id) DO UPDATE
-                SET avatar_url = EXCLUDED.avatar_url,
-                    cover_url = EXCLUDED.cover_url,
-                    updated_block = EXCLUDED.updated_block""",
+            WITH input AS (
+                SELECT a.id AS account_id, i.*
+                FROM unnest(%s::TEXT[], %s::TEXT[], %s::TEXT[], %s::INT[]) AS i (account_name, avatar_url, cover_url, updated_block)
+                JOIN proxy_whitelist_app.accounts a ON a.name = i.account_name
+            ),
+            old AS (
+                SELECT p.account_id, p.avatar_url, p.cover_url
+                FROM proxy_whitelist_app.account_profiles p
+                JOIN input i ON i.account_id = p.account_id
+            ),
+            upserted AS (
+                INSERT INTO proxy_whitelist_app.account_profiles (account_id, avatar_url, cover_url, updated_block)
+                SELECT account_id, avatar_url, cover_url, updated_block FROM input
+                ON CONFLICT (account_id) DO UPDATE
+                    SET avatar_url = EXCLUDED.avatar_url,
+                        cover_url = EXCLUDED.cover_url,
+                        updated_block = EXCLUDED.updated_block
+                RETURNING account_id
+            ),
+            changed AS (
+                SELECT i.account_name, i.updated_block,
+                       i.avatar_url IS DISTINCT FROM o.avatar_url AS avatar_changed,
+                       i.cover_url IS DISTINCT FROM o.cover_url AS cover_changed
+                FROM input i
+                LEFT JOIN old o ON o.account_id = i.account_id
+            ),
+            queued AS (
+                INSERT INTO proxy_whitelist_replica.purge_queue AS q (account_name, block, avatar_changed, cover_changed)
+                SELECT account_name, updated_block, avatar_changed, cover_changed FROM changed
+                WHERE %s AND (avatar_changed OR cover_changed)
+                ON CONFLICT (account_name) DO UPDATE
+                    SET block = GREATEST(q.block, EXCLUDED.block),
+                        avatar_changed = q.avatar_changed OR EXCLUDED.avatar_changed,
+                        cover_changed = q.cover_changed OR EXCLUDED.cover_changed
+                RETURNING account_name
+            )
+            SELECT (SELECT count(*) FROM upserted), (SELECT count(*) FROM queued)""",
                     ([r["account_name"] for r in rows], [r["avatar_url"] for r in rows],
-                     [r["cover_url"] for r in rows], [r["updated_block"] for r in rows]))
-        if cur.rowcount != len(rows):
-            raise SyncError(f"{len(rows) - cur.rowcount} profile rows name accounts the replica does not have")
+                     [r["cover_url"] for r in rows], [r["updated_block"] for r in rows], enqueue_purges))
+        row = cur.fetchone()
+        upserted = row[0] if row else 0
+        if upserted != len(rows):
+            raise SyncError(f"{len(rows) - upserted} profile rows name accounts the replica does not have")
+        return int(row[1]) if row else 0
 
     def replace_blacklists(self, urls: list[str], accounts: list[str]) -> None:
         def work(cur: psycopg.Cursor) -> tuple[int, int]:
@@ -577,6 +652,34 @@ class PgStore:
     def set_error(self, message: str) -> None:
         self._transaction(lambda cur: cur.execute(
             "UPDATE proxy_whitelist_replica.state SET sync_error = %s", (message,)))
+
+    def set_purge_enabled(self, enabled: bool) -> None:
+        self._transaction(lambda cur: cur.execute(
+            "UPDATE proxy_whitelist_replica.state SET purge_enabled = %s", (enabled,)))
+
+    def pending_purges(self, limit: int) -> list[PurgeItem]:
+        def work(cur: psycopg.Cursor) -> list[PurgeItem]:
+            cur.execute("""
+                SELECT account_name, block, avatar_changed, cover_changed
+                FROM proxy_whitelist_replica.purge_queue
+                ORDER BY block, account_name
+                LIMIT %s""", (limit,))
+            return [PurgeItem(*row) for row in cur.fetchall()]
+        return self._transaction(work)
+
+    def purges_done(self, items: list[PurgeItem]) -> None:
+        # Matched on the block too: a row a newer change raised since it was read stays queued.
+        self._transaction(lambda cur: cur.execute("""
+            DELETE FROM proxy_whitelist_replica.purge_queue q
+            USING unnest(%s::TEXT[], %s::INT[]) AS d (account_name, block)
+            WHERE q.account_name = d.account_name AND q.block = d.block""",
+                                                  ([i.account_name for i in items], [i.block for i in items])))
+
+    def purges_failed(self, items: list[PurgeItem], error: str) -> None:
+        self._transaction(lambda cur: cur.execute("""
+            UPDATE proxy_whitelist_replica.purge_queue
+            SET attempts = attempts + 1, last_error = %s
+            WHERE account_name = ANY(%s::TEXT[])""", (error, [i.account_name for i in items])))
 
 
 def run(syncer: Syncer, poll_interval_s: float, once: bool,
@@ -632,6 +735,17 @@ def _record_error(store: Store, err: SyncError) -> None:
         log.warning("could not record sync_error: %s", store_err)
 
 
+def _purger(store: PgStore) -> Purger | None:
+    config = PurgeConfig.from_env(os.environ)
+    if config is None:
+        log.info("Cloudflare purging is off: PURGE_CLOUDFLARE_ZONE, PURGE_CLOUDFLARE_TOKEN and PURGE_BASE_URL "
+                 "are not all set; profile changes are not queued")
+        return None
+    log.info("Cloudflare purging is on: zone %s, %d url templates under %s, %s s per drain",
+             config.zone, len(config.url_templates), config.base_url, config.time_budget_s)
+    return Purger(config, CloudflareClient(config), store)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--once", action="store_true", help="run one cycle and exit (1 when it fails)")
@@ -647,10 +761,12 @@ def main(argv: list[str] | None = None) -> int:
         postgres_url = os.environ["POSTGRES_URL"]
         poll_interval_s = float(os.environ.get("POLL_INTERVAL_S", "5"))
         page_limit = int(os.environ.get("PAGE_LIMIT", str(MAX_PAGE_SIZE)))
-        syncer = Syncer(HttpSource(source_url), PgStore(postgres_url), source_url, page_limit,
+        store = PgStore(postgres_url)
+        syncer = Syncer(HttpSource(source_url), store, source_url, page_limit,
                         reset=args.reset or os.environ.get("PROXY_WHITELIST_REPLICA_RESET") == "1",
                         rebuild=args.rebuild,
-                        rebuild_from_env=os.environ.get("PROXY_WHITELIST_REPLICA_REBUILD") == "1")
+                        rebuild_from_env=os.environ.get("PROXY_WHITELIST_REPLICA_REBUILD") == "1",
+                        purger=_purger(store))
     except KeyError as err:
         log.critical("missing environment variable %s", err)
         return 1

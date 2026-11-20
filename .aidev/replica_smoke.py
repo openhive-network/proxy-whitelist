@@ -20,8 +20,10 @@ exactly, byte-for-byte equal answers of
 check_url, is_whitelisted, url_accounts, avatar and cover, the replica's
 sync_status, 404 for /stream/*, new rows and empty cycles after bootstrap, a
 url author delivered below its url's block, an unreachable source, a
-changed source identity (refused, then --reset) and a forced rebuild (--rebuild,
-and PROXY_WHITELIST_REPLICA_REBUILD=1 honoured once). Writes
+changed source identity (refused, then --reset), a forced rebuild (--rebuild,
+and PROXY_WHITELIST_REPLICA_REBUILD=1 honoured once) and Cloudflare purging
+against an in-process stub of its purge_cache API (a changed avatar purged, a
+503 leaving the account pending and purged by the next run). Writes
 OUT_DIR/replica-<mode>.xml (one junit case per check); the seeded primary rows,
 block and sync_uuid are restored at the end.
 
@@ -29,7 +31,7 @@ health rebuilds the replica from the (restored) primary, then runs
 replica/healthcheck/proxy_whitelist_replica.sh against the replica's PostgREST
 admin server and database: up when in sync, down (exit 10) when last_block_time
 is older than 60 s, before the bootstrap completes and when PostgREST is not
-live. The testnet primary produces no blocks, so the age is set in the
+live, and up with a purge backlog in its reason. The testnet primary produces no blocks, so the age is set in the
 replica's state rather than waited for. Every case runs twice: with the suite's
 psql and with a shim that, like the image's psql 14, prints only the last
 statement's result of a multi-statement --command.
@@ -73,6 +75,9 @@ ODD = f"{PREFIX}-IMG\\_7570s \"q\"\t\u00e9.jpg"
 B = 910_000_000
 SEED_BLOCK, PAGE_BLOCK, PROFILE_BLOCK, HEAD1 = B + 10, B + 15, B + 20, B + 30
 NEW_BLOCK, QUIET_HEAD, LATE_AUTHOR_BLOCK, LATE_BLOCK, DOWN_BLOCK, UUID_BLOCK = B + 31, B + 40, B + 45, B + 50, B + 55, B + 60
+PURGE_BLOCK, PURGE_FAIL_BLOCK = B + 65, B + 70
+PURGE_ZONE, PURGE_TOKEN, PURGE_BASE = "aidev-zone", "aidev-purge-token", "https://images.aidev.invalid"
+AVATAR3 = f"{PREFIX}-avatar3.png"
 
 _restore: dict[str, Any] = {}
 
@@ -160,11 +165,18 @@ class Run:
         self.admin = admin
         self.syncs = 0
 
-    def sync(self, *args: str, source: str | None = None, page_limit: int = 100000, rebuild_env: str = "0") -> int:
+    def sync(self, *args: str, source: str | None = None, page_limit: int = 100000, rebuild_env: str = "0",
+             purge_api: str | None = None) -> int:
+        """One replica/sync.py --once; purge_api enables purging against that Cloudflare API base."""
         self.syncs += 1
         env = dict(os.environ, PROXY_WHITELIST_SOURCE_URL=source or self.primary, POSTGRES_URL=REPLICA_ADMIN_URL,
                    PAGE_LIMIT=str(page_limit), PROXY_WHITELIST_REPLICA_RESET="0",
                    PROXY_WHITELIST_REPLICA_REBUILD=rebuild_env, LOG_LEVEL="DEBUG")
+        for name in ("PURGE_CLOUDFLARE_ZONE", "PURGE_CLOUDFLARE_TOKEN", "PURGE_BASE_URL", "PURGE_URL_TEMPLATES"):
+            env.pop(name, None)
+        if purge_api:
+            env.update(PURGE_CLOUDFLARE_ZONE=PURGE_ZONE, PURGE_CLOUDFLARE_TOKEN=PURGE_TOKEN, PURGE_BASE_URL=PURGE_BASE,
+                       PURGE_CLOUDFLARE_API_URL=purge_api)
         log_path = os.path.join(self.out_dir, self.log_name())
         with open(log_path, "w", encoding="utf-8") as log:
             return subprocess.run([sys.executable, str(ROOT / "replica" / "sync.py"), "--once", *args],
@@ -317,7 +329,8 @@ def check_sync_status_shape(run: Run) -> None:
     status = run.status()
     missing = set(primary) - set(status)
     assert not missing, f"replica /sync-status lacks the primary's {missing}"
-    extra = {"source_sync_uuid", "source_url", "polled_at", "bootstrap_complete", "sync_error"}
+    extra = {"source_sync_uuid", "source_url", "polled_at", "bootstrap_complete", "sync_error",
+             "purge_enabled", "purge_pending", "purge_oldest_block", "purge_last_error"}
     assert extra <= set(status), f"replica /sync-status lacks {extra - set(status)}"
     assert status["last_block_num"] == HEAD1 and status["source_sync_uuid"] == primary["sync_uuid"], f"{status} vs {primary}"
     assert status["sync_uuid"] == replica_sql("select replica_sync_uuid from proxy_whitelist_replica.state") \
@@ -426,6 +439,82 @@ def check_rebuild(run: Run) -> None:
     same_counts()
 
 
+class CloudflareStub:
+    """Cloudflare's POST /zones/{zone}/purge_cache: records each call's files, answers `status`."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.status = 200
+        self.calls: list[list[str]] = []
+
+
+@contextlib.contextmanager
+def cloudflare_stub() -> Iterator[CloudflareStub]:
+    stub: CloudflareStub
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            authorized = (self.path == f"/client/v4/zones/{PURGE_ZONE}/purge_cache"
+                          and self.headers.get("Authorization") == f"Bearer {PURGE_TOKEN}")
+            stub.calls.append(sorted(body["files"]) if authorized else [f"unauthorized {self.path}"])
+            status = stub.status if authorized else 403
+            payload = json.dumps({"success": status == 200, "errors": [], "messages": []}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", free_port()), Handler)
+    stub = CloudflareStub(f"http://127.0.0.1:{server.server_address[1]}/client/v4")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield stub
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def purge_urls(account: str, *kinds: str) -> list[str]:
+    paths = {"avatar": ["avatar", "avatar/small", "avatar/medium", "avatar/large"], "cover": ["cover"]}
+    return sorted(f"{PURGE_BASE}{prefix}/u/{account}/{p}" for kind in kinds for p in paths[kind] for prefix in ("", "/webp"))
+
+
+def check_purge(run: Run) -> None:
+    with cloudflare_stub() as stub:
+        set_profile(ALICE, ALICE_ID, AVATAR3, COVER, PURGE_BLOCK)
+        set_head(PURGE_BLOCK)
+        run.synced(purge_api=stub.url)
+        assert stub.calls == [purge_urls(ALICE, "avatar")], f"purge calls {stub.calls}"
+        status = run.status()
+        assert (status["purge_enabled"], status["purge_pending"], status["purge_oldest_block"]) == (True, 0, None), \
+            f"{status}"
+        assert json.loads(run.same("GET", f"/avatar/{ALICE}")) == AVATAR3
+
+        stub.status = 503
+        set_profile(BOB, BOB_ID, AVATAR, COVER, PURGE_FAIL_BLOCK)
+        set_head(PURGE_FAIL_BLOCK)
+        run.synced(purge_api=stub.url)
+        status = run.status()
+        assert (status["purge_pending"], status["purge_oldest_block"]) == (1, PURGE_FAIL_BLOCK), f"{status}"
+        assert "HTTP 503" in (status["purge_last_error"] or ""), f"{status}"
+        assert status["sync_error"] is None and status["last_block_num"] == PURGE_FAIL_BLOCK, f"{status}"
+        assert len(stub.calls) == 2, f"purge calls {stub.calls}"
+
+        stub.status = 200
+        run.synced(purge_api=stub.url)
+        assert stub.calls[2:] == [purge_urls(BOB, "avatar", "cover")], f"purge calls {stub.calls}"
+        status = run.status()
+        assert (status["purge_pending"], status["purge_last_error"]) == (0, None), f"{status}"
+    run.synced()
+    assert run.status()["purge_enabled"] is False
+
+
 SMOKE_CHECKS: list[tuple[str, Callable[[Run], None]]] = [
     ("a PAGE_LIMIT=2 cycle replicates exactly the 5 urls of one block", check_paged_cycle),
     ("a url and an avatar with a backslash, a quote, a tab and é are replicated exactly", check_exact_values),
@@ -438,6 +527,7 @@ SMOKE_CHECKS: list[tuple[str, Callable[[Run], None]]] = [
     ("an unreachable source sets sync_error and freezes last_block_time; syncing resumes", check_unreachable_source),
     ("a changed sync_uuid is refused, --reset bootstraps again to equality", check_identity_change),
     ("--rebuild and PROXY_WHITELIST_REPLICA_REBUILD=1 (once) bootstrap again to equality", check_rebuild),
+    ("a changed avatar is purged at Cloudflare; a 503 leaves it pending until the next run", check_purge),
 ]
 AGENT = ROOT / "replica" / "healthcheck" / "proxy_whitelist_replica.sh"
 # busybox date's -d "YYYY.MM.DD-HH:MM:SS" (check_http_sync_age.sh) for the suites' coreutils date.
@@ -506,6 +596,13 @@ def check_health(run: Run) -> None:
             replica_sql("update proxy_whitelist_replica.state set bootstrap_complete = true, "
                         f"source_block_num = {state.partition('|')[0] or 1}, source_block_time = now()")
             assert agent(live, before_15) == (0, "up"), f"in sync, {psql_}: {agent(live, before_15)}"
+            replica_sql("insert into proxy_whitelist_replica.purge_queue (account_name, block, avatar_changed, "
+                        "cover_changed) values ('aidev-purge-backlog', 123, true, false)")
+            try:
+                assert agent(live, before_15) == (0, "up #proxy_whitelist_replica purge backlog: 1 accounts since "
+                                                     "block 123"), f"purge backlog, {psql_}: {agent(live, before_15)}"
+            finally:
+                replica_sql("delete from proxy_whitelist_replica.purge_queue where account_name = 'aidev-purge-backlog'")
             replica_sql("update proxy_whitelist_replica.state set source_block_time = now() - interval '2 minutes'")
             rc, answer = agent(live, before_15)
             assert (rc, answer.split(" (")[0]) == (10, "down #proxy_whitelist_replica block too old"), \

@@ -14,7 +14,9 @@ locally instead of across the network. It serves the primary's own API
   over them, and the replica's `sync_status()` (`replica/db/replica_sync_status.sql`).
   The `/stream/*` functions are not installed: a replica is not a source.
 - **replica-sync** — `replica/sync.py`, following the primary's replication
-  streams (contract v2, `endpoints/stream.sql`).
+  streams (contract v2, `endpoints/stream.sql`), and, where enabled, purging
+  the imagehoster's avatar/cover redirects at Cloudflare (`replica/purge.py`,
+  see [Cache invalidation](#cache-invalidation)).
 - **replica-postgrest** and **replica-rewriter** — PostgREST on the endpoint
   schema behind the same URL rewriter as the primary, so paths match.
 - **replica-agent** — haproxy's agent check for the replica
@@ -173,6 +175,10 @@ fields, with the values of the primary the replica has **fully** replicated:
 | `polled_at` | when the last full cycle finished |
 | `bootstrap_complete` | the first full catch-up is done |
 | `sync_error` | the last failure, cleared by the next full cycle |
+| `purge_enabled` | the running syncer purges Cloudflare ([Cache invalidation](#cache-invalidation)) |
+| `purge_pending` | accounts in `proxy_whitelist_replica.purge_queue` waiting for their purge |
+| `purge_oldest_block` | the lowest profile block among them, `null` when none waits |
+| `purge_last_error` | the error of the most often failed waiting account, `null` when none failed |
 
 `last_block_time` stops advancing whenever the primary stalls, the link to it
 drops, the syncer dies or the source identity changes. A quiet hour without new
@@ -193,7 +199,11 @@ gate: PostgREST's `/live` (haf_api_node's `check_postgrest_live`), then
 prints `up`, or `down #<reason>` and exits 10, like the stock agents, so
 haproxy's `agent-check` uses it unchanged: up when in sync, down within a minute
 of the primary or the syncer stopping, during a bootstrap or rebuild, and when
-PostgREST is not live. It never queries `hive.*` or `hafd.*`.
+PostgREST is not live. It never queries `hive.*` or `hafd.*`. A Cloudflare purge
+backlog keeps it `up` (a stale avatar redirect is no reason to send whitelist
+traffic to the primary) with the backlog as its reason,
+`up #proxy_whitelist_replica purge backlog: N accounts since block B`, which
+haproxy shows in `show stat`.
 
 haf_api_node's `check_http_sync_age.sh` and `format_seconds.sh` are
 **vendored** next to it (unchanged, from haf_api_node `develop` at `0a619f2e`),
@@ -230,6 +240,100 @@ REPLICA_POSTGRES_URL=postgresql://proxy_whitelist_user:$REPLICA_API_PASSWORD@127
 
 On a host without busybox `date` the vendored age check cannot parse the block
 time (`down #… unparseable block time`); run it in the image there.
+
+## Cache invalidation
+
+`images.hive.blog/u/<name>/avatar[/<size>]` and `/u/<name>/cover` are 302
+redirects that Cloudflare caches for a day (imagehoster#15). When an account
+changes its profile image, those cached redirects have to be purged, and only
+**after** the replica the imagehoster reads has committed the new profile:
+a Cloudflare miss right after an earlier purge would reach an imagehoster still
+redirecting to the old image and cache that for another day.
+
+The syncer therefore purges itself, through an outbox. In the transaction that
+applies a `/stream/profiles` page (and its cursor), every account whose
+`avatar_url` or `cover_url` differs from the stored one (`IS DISTINCT FROM`, so
+setting, changing and removing all count) is upserted into
+`proxy_whitelist_replica.purge_queue` with the profile's block and which of the
+two changed. Rows that change only other fields are not queued. A second change
+of the same account before its purge raises the row's block and ORs the flags:
+one purge covers both. After the commit — after each page that queued
+something, and at the end of every cycle so an earlier backlog drains too —
+the queue is drained, lowest block first, in calls of at most 30 URLs
+(`POST /zones/{zone}/purge_cache` with `files`, Cloudflare's per-request limit
+outside the Enterprise plan) for at most `PURGE_TIME_BUDGET_S` (default 5 s)
+per drain; a call started within the budget runs to its end or its 10 s timeout.
+A purged account's row is deleted; purging is idempotent at Cloudflare, so the
+rare repeat after a crash between the call and the delete is harmless
+(at-least-once).
+
+A failed call (HTTP error, connection error, an answer without `success`)
+increments `attempts` and sets `last_error` on its rows, stops the drain and
+defers the next one by 3 s doubling to 300 s, or by `Retry-After` on HTTP 429;
+it never sets `sync_error`, never moves a cursor and never stops the sync.
+Draining never writes replicated tables, and applying never calls Cloudflare.
+
+**Bootstrap rule.** Accounts are queued only by a cycle that starts with
+`bootstrap_complete` already true. A bootstrap, `--reset` or `--rebuild`
+applies every historical profile and purges nothing; `--reset` and `--rebuild`
+also truncate `purge_queue` with the replicated tables.
+
+### Enabling it
+
+Purging is off unless all three of these are set for `replica-sync` (in
+`replica/.env`); with any unset nothing is queued either, so a replica without
+purge duty accumulates no queue, and the syncer logs at start that purging is off.
+Enable it on **one** replica per zone.
+
+| variable | |
+| --- | --- |
+| `PURGE_CLOUDFLARE_ZONE` | the zone id of the images domain |
+| `PURGE_CLOUDFLARE_TOKEN` | an API token scoped to that zone with the **Zone → Cache Purge** permission only; read from the environment, never logged |
+| `PURGE_BASE_URL` | the public base of the redirects, e.g. `https://images.hive.blog` |
+| `PURGE_URL_TEMPLATES` | optional: comma-separated URLs with `{base}` and `{name}`; a template containing `/avatar` is purged on an avatar change, one containing `/cover` on a cover change (each has to contain exactly one of them; at most 30) |
+| `PURGE_TIME_BUDGET_S` | optional: seconds per drain in which calls are started (default 5); lower it if the zone's purge rate limit is hit |
+| `PURGE_CLOUDFLARE_API_URL` | optional: the API base (default `https://api.cloudflare.com/client/v4`; the tests point it at a stub) |
+
+The default URL list is `cf-cache-purger`'s, ten URLs per account (eight on an
+avatar change, two on a cover change):
+
+```
+{base}/u/{name}/avatar         {base}/webp/u/{name}/avatar
+{base}/u/{name}/avatar/small   {base}/webp/u/{name}/avatar/small
+{base}/u/{name}/avatar/medium  {base}/webp/u/{name}/avatar/medium
+{base}/u/{name}/avatar/large   {base}/webp/u/{name}/avatar/large
+{base}/u/{name}/cover          {base}/webp/u/{name}/cover
+```
+
+The `/p/<base58(url)>?width=…` objects the redirects point to are keyed by the
+image URL itself and need no purge; browsers may keep an old redirect for up
+to 10 minutes (`max-age=600`).
+
+### Reading the backlog
+
+`/sync-status` reports `purge_enabled`, `purge_pending`, `purge_oldest_block`
+and `purge_last_error`. A `purge_pending` that stays above 0 with a
+`purge_last_error` means Cloudflare refuses or is unreachable (a 403 is a
+token without Cache Purge on that zone; a 429 the zone's rate limit). The rows
+themselves:
+
+```sh
+docker compose -f replica/compose.yml --env-file replica/.env exec replica-db \
+  psql -U postgres proxy_whitelist -c "table proxy_whitelist_replica.purge_queue"
+```
+
+A permanently failing row is retried forever and holds back the rows behind
+it; deleting it gives up its purge (its redirects expire within a day).
+
+### Retiring `cf-cache-purger`
+
+`blocktrades/cf-cache-purger` follows the chain separately and purges on every
+`account_update`, unordered with the replica's commit. Once purging is enabled
+on the img2 replica and a test account's profile change has been seen to queue
+and drain (`purge_pending` back to 0, `curl -I
+https://images.hive.blog/u/<test>/avatar` redirecting to the new image), stop
+`cf-cache-purger` on img2. Its Varnish purge is not replaced: img2 runs no
+Varnish.
 
 ## Fronting it with haproxy (next step)
 
