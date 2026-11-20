@@ -21,8 +21,9 @@
 #                     and every tests/sql/*.sql check passes against the installed app
 #   - reinstall       install_app.sh a second time over the installed app (there is
 #                     no uninstall script; the installer is idempotent), the
-#                     endpoint schema is still there and the stream source
-#                     identity (app_status.sync_uuid) is unchanged
+#                     endpoint schema is still there, the stream source
+#                     identity (app_status.sync_uuid) is unchanged and the
+#                     accounts backfill logs 0 rows
 #   - api-smoke       .aidev/api_smoke.py: PostgREST on the installed schema as
 #                     production runs it, then check_url through unknown →
 #                     whitelisted → blacklisted, the blacklisted_accounts form,
@@ -161,6 +162,9 @@ reinstall() {
     after="$(query "select sync_uuid from proxy_whitelist_app.app_status")" || return 1
     [ -n "$before" ] && [ "$before" = "$after" ] || { echo "sync_uuid changed on reinstall: '$before' -> '$after'"; return 1; }
     echo "sync_uuid kept: $after"
+    grep -q "accounts: backfilled 0 accounts at block " "$out/install_app.log" \
+        || { echo "the reinstall's backfill_accounts did not log 0 rows backfilled"; return 1; }
+    echo "accounts backfill: 0 rows on reinstall"
 }
 
 # replica_query SQL: one value, as the replica's superuser

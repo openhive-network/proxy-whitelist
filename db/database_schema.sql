@@ -51,6 +51,10 @@ BEGIN
   -- above are re-derived, see check_stream_rewind().
   ALTER TABLE proxy_whitelist_app.app_status
     ADD COLUMN IF NOT EXISTS stream_head_block INT;
+  -- Every hivemind account with an id up to this one has an accounts row
+  -- (track_account_creations()); NULL until the install's backfill_accounts().
+  ALTER TABLE proxy_whitelist_app.app_status
+    ADD COLUMN IF NOT EXISTS accounts_tracked_hive_id INT;
   -- The version of the /stream/* contract this code serves (endpoints/stream.sql).
   ALTER TABLE proxy_whitelist_app.app_status
     ALTER COLUMN stream_schema_version SET DEFAULT 2;

@@ -265,6 +265,74 @@ BEGIN
 END;
 $$;
 
+-- Give every hivemind account above app_status.accounts_tracked_hive_id (all
+-- of them while it is NULL) an accounts row labelled _block, and move the
+-- cursor to the highest hivemind id seen. A cursor rather than the highest
+-- hive_id in accounts: the other insert sites (ensure_account) may add an
+-- account above ones not yet tracked. Accounts that already have a row keep
+-- it. _block must be above every block the streams have served, or a replica
+-- never sees the new rows. Returns the rows written.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.track_account_creations(_block INT)
+RETURNS INT
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    __from INT;
+    __to INT;
+    __count INT;
+BEGIN
+    SELECT accounts_tracked_hive_id INTO __from
+    FROM proxy_whitelist_app.app_status
+    FOR UPDATE;
+
+    -- Bounded, as hivemind may be adding accounts while this runs.
+    SELECT max(ha.id) INTO __to
+    FROM hivemind_app.hive_accounts ha
+    WHERE __from IS NULL OR ha.id > __from;
+    IF __to IS NULL THEN
+        RETURN 0;
+    END IF;
+
+    INSERT INTO proxy_whitelist_app.accounts (hive_id, name, first_block)
+    SELECT ha.id, ha.name, _block
+    FROM hivemind_app.hive_accounts ha
+    WHERE (__from IS NULL OR ha.id > __from) AND ha.id <= __to
+    ON CONFLICT (hive_id) DO NOTHING;
+    GET DIAGNOSTICS __count = ROW_COUNT;
+
+    UPDATE proxy_whitelist_app.app_status SET accounts_tracked_hive_id = __to;
+    RETURN __count;
+END;
+$$;
+
+-- Install-time fill of accounts with the hivemind accounts it lacks (on the
+-- first install with this function, every one this app has not seen as an
+-- author or a profile; afterwards only those created since the last processed
+-- block, normally none). Rows are labelled stream_head_block + 1, never the
+-- sentinel or an older block: a replica that has applied the streams up to
+-- stream_head_block never reads that block range again, so a backfilled row
+-- must carry a block above it to reach the replica's next page. Returns the
+-- rows written.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.backfill_accounts()
+RETURNS INT
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    __block INT;
+    __count INT;
+BEGIN
+    SELECT stream_head_block + 1 INTO STRICT __block FROM proxy_whitelist_app.app_status;
+    IF __block IS NULL THEN
+        RAISE EXCEPTION 'backfill_accounts: app_status.stream_head_block is not recorded (check_stream_rewind() runs first)';
+    END IF;
+    __count := proxy_whitelist_app.track_account_creations(__block);
+    RAISE NOTICE 'accounts: backfilled % accounts at block %', __count, __block;
+    RETURN __count;
+END;
+$$;
+
 -- Block range processing wrapper for massive processing stage.
 CREATE OR REPLACE FUNCTION proxy_whitelist_app.block_range_data(
     _from INT, _to INT, _logs BOOLEAN, _worker INT
@@ -483,6 +551,11 @@ BEGIN
     -- which moves in the same transaction.
     PERFORM proxy_whitelist_app.check_stream_rewind(_block_range.first_block - 1);
     UPDATE proxy_whitelist_app.app_status SET stream_head_block = _block_range.last_block;
+
+    -- Before the posts and profiles: labelled with the range's first block,
+    -- an account created in the range is not later in the streams than the
+    -- rows of the same range that name it.
+    PERFORM proxy_whitelist_app.track_account_creations(_block_range.first_block);
 
     IF hive.get_current_stage_name(_context_name) = 'MASSIVE_PROCESSING' THEN
         CALL proxy_whitelist_app.massive_processing(

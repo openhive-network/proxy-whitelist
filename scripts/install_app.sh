@@ -163,6 +163,11 @@ psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
 psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
   -c "SET ROLE proxy_whitelist_owner; SELECT ${PROXY_WHITELIST_SCHEMA}.backfill_account_profiles();"
 
+# Every hivemind account the app lacks, labelled above the stream head that
+# check_stream_rewind() has just made current (only new ones after the first run)
+psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
+  -c "SET ROLE proxy_whitelist_owner; SELECT ${PROXY_WHITELIST_SCHEMA}.backfill_accounts();"
+
 # Install endpoint schema (PostgREST API)
 psql "$POSTGRES_ACCESS" -v ON_ERROR_STOP=on \
   -c "SET SEARCH_PATH TO ${PROXY_WHITELIST_SCHEMA};" \

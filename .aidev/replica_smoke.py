@@ -214,10 +214,12 @@ def set_profile(account: str, hive_id: int, avatar: str, cover: str, block: int)
     """)
 
 
-def counts(run_sql: Callable[[str], str]) -> str:
-    return run_sql("""
+def counts(run_sql: Callable[[str], str], head: int) -> str:
+    """The row counts a replica at `head` must match; accounts the install's
+    backfill labelled above the primary's head are not served yet."""
+    return run_sql(f"""
         select format('accounts %s, urls %s, url_authors %s, profiles %s, blacklisted urls %s, blacklisted accounts %s',
-            (select count(*) from proxy_whitelist_app.accounts),
+            (select count(*) from proxy_whitelist_app.accounts where first_block <= {head}),
             (select count(*) from proxy_whitelist_app.urls),
             (select count(*) from proxy_whitelist_app.url_authors),
             (select count(*) from proxy_whitelist_app.account_profiles),
@@ -226,7 +228,8 @@ def counts(run_sql: Callable[[str], str]) -> str:
 
 
 def same_counts() -> None:
-    primary, replica = counts(psql), counts(replica_sql)
+    head = primary_head()
+    primary, replica = counts(psql, head), counts(replica_sql, head)
     assert primary == replica, f"primary has {primary}, replica {replica}"
 
 
