@@ -11,6 +11,9 @@ SET ROLE proxy_whitelist_owner;
  * the first full catch-up (bootstrap_complete). sync_uuid is the replica's own
  * identity (re-minted when it truncates and bootstraps again), not the
  * source's: the replica serves no streams under the source's identity.
+ * purge_* describe the Cloudflare purge outbox (purge_queue): whether this
+ * replica purges, how many accounts wait, the lowest block among them and the
+ * error of the most often failed one.
  */
 CREATE OR REPLACE FUNCTION proxy_whitelist_replica.sync_status()
 RETURNS JSON
@@ -31,7 +34,16 @@ BEGIN
       'source_url', s.source_url,
       'polled_at', to_char(s.polled_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS'),
       'bootstrap_complete', s.bootstrap_complete,
-      'sync_error', s.sync_error
+      'sync_error', s.sync_error,
+      'purge_enabled', s.purge_enabled,
+      'purge_pending', (SELECT count(*) FROM proxy_whitelist_replica.purge_queue),
+      'purge_oldest_block', (SELECT min(q.block) FROM proxy_whitelist_replica.purge_queue q),
+      'purge_last_error', (
+        SELECT q.last_error FROM proxy_whitelist_replica.purge_queue q
+        WHERE q.last_error IS NOT NULL
+        ORDER BY q.attempts DESC, q.block
+        LIMIT 1
+      )
     )
     FROM proxy_whitelist_replica.state s
   );
@@ -49,6 +61,7 @@ $$;
 
 GRANT USAGE ON SCHEMA proxy_whitelist_replica TO proxy_whitelist_user;
 GRANT SELECT ON proxy_whitelist_replica.state TO proxy_whitelist_user;
+GRANT SELECT ON proxy_whitelist_replica.purge_queue TO proxy_whitelist_user;
 GRANT EXECUTE ON FUNCTION proxy_whitelist_replica.sync_status() TO proxy_whitelist_user;
 GRANT EXECUTE ON FUNCTION proxy_whitelist_endpoints.sync_status() TO proxy_whitelist_user;
 

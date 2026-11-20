@@ -16,7 +16,9 @@
 # search_path as a startup option, safe on the replica's plain Postgres (there is
 # no pgbouncer to drop it). The liveness and age checks are still the vendored ones.
 #
-# Prints "up", or "down #<reason>" and exits 10, like the stock agents.
+# Prints "up", or "down #<reason>" and exits 10, like the stock agents. A
+# Cloudflare purge backlog (purge_pending > 0) stays "up", with the backlog as
+# its reason: a stale avatar redirect is no reason to route whitelist traffic away.
 #
 #   REPLICA_LIVE_URL      PostgREST's admin /live (default http://replica-postgrest:3001/live)
 #   REPLICA_POSTGRES_URL  the replica database as proxy_whitelist_user (required)
@@ -66,8 +68,13 @@ if ! _result=$(
       exit 15
     fi
     check_http_block_time "$_name" 60 "$_block_time"
+    _purge_pending=$(echo "$_sync_status" | sed -n 's/.*"purge_pending"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+    if [ -n "$_purge_pending" ] && [ "$_purge_pending" -gt 0 ]; then
+      _purge_oldest=$(echo "$_sync_status" | sed -n 's/.*"purge_oldest_block"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+      echo "#$_name purge backlog: $_purge_pending accounts since block $_purge_oldest"
+    fi
   ); then
   echo "$_result"
   exit 10
 fi
-echo "up"
+echo "up${_result:+ $_result}"
