@@ -14,7 +14,9 @@ runs with --once as a subprocess (its logs go to OUT_DIR/replica-<mode>-sync-*.l
 
 smoke seeds the primary at fixed blocks far above the testnet's (moving the
 app's processed block, like api_smoke.py), then checks, cycle by cycle: a
-PAGE_LIMIT=2 cycle over 5 urls of one block, byte-for-byte equal answers of
+PAGE_LIMIT=2 cycle over 5 urls of one block, a url and an avatar holding a
+backslash (and the url a double quote, a tab and a non-ASCII character) stored
+exactly, byte-for-byte equal answers of
 check_url, is_whitelisted, url_accounts, avatar and cover, the replica's
 sync_status, 404 for /stream/*, new rows and empty cycles after bootstrap, a
 url author delivered below its url's block, an unreachable source, a
@@ -63,7 +65,9 @@ CAROL, CAROL_ID = "aidev-replica-c", 2147000103
 UNKNOWN_ACCOUNT = "aidev-replica-none"
 URL1, BLACK, NEW, LATE, DOWN, AFTER_UUID = (f"{PREFIX}-{n}.png" for n in ("1", "black", "new", "late", "down", "uuid"))
 PAGE_URLS = [f"{PREFIX}-page-{i}.png" for i in range(5)]
-AVATAR, AVATAR2, COVER = (f"{PREFIX}-{n}.png" for n in ("avatar", "avatar2", "cover"))
+AVATAR, AVATAR2, COVER = (f"{PREFIX}-{n}.png" for n in ("avatar\\_1", "avatar2", "cover"))
+# PostgREST's text/csv doubles the backslash and escapes the quote and the tab.
+ODD = f"{PREFIX}-IMG\\_7570s \"q\"\t\u00e9.jpg"
 B = 910_000_000
 SEED_BLOCK, PAGE_BLOCK, PROFILE_BLOCK, HEAD1 = B + 10, B + 15, B + 20, B + 30
 NEW_BLOCK, QUIET_HEAD, LATE_AUTHOR_BLOCK, LATE_BLOCK, DOWN_BLOCK, UUID_BLOCK = B + 31, B + 40, B + 45, B + 50, B + 55, B + 60
@@ -250,7 +254,7 @@ def same_answers(run: Run) -> None:
 def seed() -> None:
     _restore["head"] = primary_head()
     _restore["sync_uuid"] = primary_sync_uuid()
-    whitelist([URL1, BLACK], ALICE, ALICE_ID, SEED_BLOCK)
+    whitelist([URL1, BLACK, ODD], ALICE, ALICE_ID, SEED_BLOCK)
     whitelist(PAGE_URLS, ALICE, ALICE_ID, PAGE_BLOCK)
     psql(f"""
         set role proxy_whitelist_owner;
@@ -297,6 +301,13 @@ def check_paged_cycle(run: Run) -> None:
     got = replica_sql(f"select count(*) from proxy_whitelist_app.urls where url like '{PREFIX}-page-%'")
     assert got == "5", f"{got} page urls on the replica"
     same_counts()
+
+
+def check_exact_values(run: Run) -> None:
+    got = replica_sql(f"select md5(url) from proxy_whitelist_app.urls where url = '{ODD}'")
+    assert got == md5(ODD), f"replica md5 of {ODD!r}: {got!r}"
+    assert run.same("POST", "/whitelist/check", {"url": ODD}) == b'"whitelisted"'
+    assert json.loads(run.same("GET", f"/avatar/{ALICE}")) == AVATAR
 
 
 def check_sync_status_shape(run: Run) -> None:
@@ -415,6 +426,7 @@ def check_rebuild(run: Run) -> None:
 
 SMOKE_CHECKS: list[tuple[str, Callable[[Run], None]]] = [
     ("a PAGE_LIMIT=2 cycle replicates exactly the 5 urls of one block", check_paged_cycle),
+    ("a url and an avatar with a backslash, a quote, a tab and é are replicated exactly", check_exact_values),
     ("check_url, is_whitelisted, url_accounts, avatar and cover answer like the primary", same_answers),
     ("sync_status has the primary's fields and the replica's", check_sync_status_shape),
     ("the replica serves no /stream/*", check_no_streams),

@@ -50,13 +50,26 @@ confirm that the wheel installs and `python3 -c 'import psycopg'` works in it.
 Every `POLL_INTERVAL_S` (default 5) the syncer reads the primary's
 `/sync-status`, pages `/stream/accounts`, `/stream/urls`, `/stream/url-authors`
 and `/stream/profiles` from its cursors up to the primary's `last_block_num`
-(`PAGE_LIMIT` rows per page, default and maximum 100000; CSV when the primary
-offers it), replaces both blacklists from `/stream/blacklists`, and then records
-that block as replicated. Each page is applied together with its cursor in one
-transaction: a failure (HTTP error, timeout, undecodable page — including a
-CSV field over 1 MiB —, constraint violation) is logged with the stream and
-cursor, sets `sync_error` and is retried after 3 s, doubling up to 60 s, from the
-last applied page.
+(`PAGE_LIMIT` rows per page, default and maximum 100000), replaces both
+blacklists from `/stream/blacklists`, and then records that block as replicated.
+Each page is applied together with its cursor in one transaction: a failure
+(HTTP error, timeout, undecodable page — including a corrupt gzip body —,
+constraint violation) is logged with the stream and cursor, sets `sync_error`
+and is retried after 3 s, doubling up to 60 s, from the last applied page.
+
+Pages are requested and read as `application/json` only. PostgREST's `text/csv`
+renders each value as its JSON encoding with the quotes removed, so a url with
+a backslash, a double quote or a control character arrives altered (one `\`
+becomes `\\`); the url md5 check rejects such a page and a profile url would be
+stored corrupted. That encoding is not documented, so CSV is not used at all.
+
+Every request sends `Accept-Encoding: gzip`; a `Content-Encoding: gzip` answer
+(caddy's `encode`) is decompressed before it is parsed, and an uncompressed
+answer is read as is. A urls page of 100000 rows is about 17 MB as JSON and
+about 6 MB compressed. The first stream page of a process logs at INFO whether
+the source compresses (`the source compresses stream pages` or `the source does
+not compress stream pages`), so a slow bootstrap over the WAN can be told apart
+from one whose path strips compression.
 
 ### Page budget
 

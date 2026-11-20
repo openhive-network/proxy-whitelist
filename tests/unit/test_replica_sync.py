@@ -2,8 +2,8 @@
 in-memory source that serves stream contract v2 and an in-memory store, and
 its HTTP client against that source answering in place of urllib. No
 database, no network."""
-import csv
 import email.message
+import gzip
 import hashlib
 import importlib.util
 import io
@@ -159,35 +159,40 @@ class FakeStore:
 
 
 SOURCE_URL = "http://primary.invalid/proxy-whitelist-api"
-CSV_FIELDS = {"accounts": ["first_block", "hive_id", "name"], "urls": ["first_block", "md5", "url"],
-              "url_authors": ["first_block", "url_md5", "account_name"]}
 
 
 class HttpFixture:
     """A FakeSource behind the primary's URL rewriter, answering HttpSource's urllib requests.
 
     failures[stream] are raised, one per request, before that stream's next pages are
-    served; bodies[stream] replaces the body of its pages."""
+    served; bodies[stream] replaces the body of its pages, sent with body_headers. With
+    gzip set, answers to a request accepting gzip are compressed, as caddy's encode
+    directive does."""
 
     def __init__(self, source: FakeSource) -> None:
         self.source = source
         self.failures: dict[str, list[Exception]] = {}
         self.bodies: dict[str, bytes] = {}
+        self.body_headers: dict[str, str] = {}
+        self.gzip = False
+        self.accept_headers: set[tuple[str | None, str | None]] = set()
         self.page_requests: list[tuple[str, int, dict[str, str], int, str]] = []
 
     def urlopen(self, req: urllib.request.Request, timeout: float) -> "Response":
         url = urllib.parse.urlsplit(req.full_url)
         path = url.path.removeprefix(urllib.parse.urlsplit(SOURCE_URL).path)
         query = dict(urllib.parse.parse_qsl(url.query))
+        self.accept_headers.add((req.get_header("Accept"), req.get_header("Accept-encoding")))
+        compress = self.gzip and "gzip" in (req.get_header("Accept-encoding") or "")
         if path == "/sync-status":
             status = self.source.status()
             return self._answer(json.dumps({
                 "last_block_num": status.block_num, "last_block_time": status.block_time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "sync_uuid": status.sync_uuid, "stream_schema_version": status.stream_schema_version,
-                "stream_sentinel_block": status.stream_sentinel_block}).encode(), "application/json")
+                "stream_sentinel_block": status.stream_sentinel_block}).encode(), compress)
         if path == "/stream/blacklists":
             urls, accounts = self.source.blacklists()
-            return self._answer(json.dumps({"urls": urls, "accounts": accounts}).encode(), "application/json")
+            return self._answer(json.dumps({"urls": urls, "accounts": accounts}).encode(), compress)
         stream = next(s for s in sync.STREAMS if s.path == path)
         after = {p: query[p] for p in stream.after_params if p in query}
         failures = self.failures.get(stream.name, [])
@@ -198,18 +203,15 @@ class HttpFixture:
         page = self.source.page(stream, int(query["from_block"]), int(query["to_block"]), after, int(query["page_size"]))
         headers = {"Stream-To-Block": str(page.to_block), "Stream-Sync-Uuid": page.sync_uuid}
         if stream.name in self.bodies:
-            return self._answer(self.bodies[stream.name], "text/csv", headers)
-        if stream.csv and req.get_header("Accept") == "text/csv":
-            out = io.StringIO()
-            writer = csv.DictWriter(out, CSV_FIELDS[stream.name])
-            writer.writeheader()
-            writer.writerows(page.rows)
-            return self._answer(out.getvalue().encode(), "text/csv", headers)
-        return self._answer(json.dumps(page.rows).encode(), "application/json", headers)
+            return Response(self.bodies[stream.name], {"Content-Type": "application/json", **headers, **self.body_headers})
+        return self._answer(json.dumps(page.rows).encode(), compress, headers)
 
     @staticmethod
-    def _answer(body: bytes, content_type: str, headers: dict[str, str] | None = None) -> "Response":
-        return Response(body, {"Content-Type": content_type, **(headers or {})})
+    def _answer(body: bytes, compress: bool, headers: dict[str, str] | None = None) -> "Response":
+        headers = {"Content-Type": "application/json", **(headers or {})}
+        if compress:
+            body, headers["Content-Encoding"] = gzip.compress(body), "gzip"
+        return Response(body, headers)
 
 
 class Response(io.BytesIO):
@@ -571,17 +573,55 @@ def test_a_page_size_below_the_minimum_is_not_halved(http: HttpFixture) -> None:
     assert [r[3] for r in http.page_requests if r[0] == "urls"] == [100]
 
 
-def test_a_csv_field_over_the_limit_is_a_sync_error_and_retried(http: HttpFixture) -> None:
+ODD_URL = "https://a.invalid/TDGWlLc8-IMG\\_7570s \"q\"\t\u00e9.jpg"
+ODD_AVATAR = "https://a.invalid/avatar\\_1.png"
+
+
+def test_pages_are_read_as_json_with_every_value_exact(http: HttpFixture) -> None:
     store = FakeStore()
-    oversized = "https://a.invalid/" + "x" * sync.CSV_FIELD_SIZE_LIMIT
-    http.bodies["urls"] = f"first_block,md5,url\r\n10,{md5(oversized)},{oversized}\r\n".encode()
+    http.source.add_url(ODD_URL, "alice", 1, 18)
+    http.source.set_profile("alice", ODD_AVATAR, None, 19)
+    assert sync.run(syncer(sync.HttpSource(SOURCE_URL), store), 5, once=True) == 0
+
+    assert ODD_URL.count("\\") == 1 and store.urls[md5(ODD_URL)] == ODD_URL
+    assert all(md5(url) == key for key, url in store.urls.items())
+    assert store.profiles["alice"] == (ODD_AVATAR, None, 19)
+    assert {accept for accept, _ in http.accept_headers} == {"application/json"}
+
+
+@pytest.mark.parametrize("compressed", [True, False], ids=["gzip", "identity"])
+def test_a_compressed_source_yields_the_same_rows_and_the_first_page_logs_whether_it_compresses(
+        http: HttpFixture, compressed: bool, caplog: pytest.LogCaptureFixture) -> None:
+    http.gzip = compressed
+    http.source.add_url(ODD_URL, "alice", 1, 18)
+    store, expected = FakeStore(), FakeStore()
+    syncer(http.source, expected).cycle()
+    with caplog.at_level(logging.INFO, logger="proxy_whitelist_replica"):
+        assert sync.run(syncer(sync.HttpSource(SOURCE_URL), store), 5, once=True) == 0
+
+    assert (store.accounts, store.urls, store.url_authors, store.profiles, store.blacklist) == \
+        (expected.accounts, expected.urls, expected.url_authors, expected.profiles, expected.blacklist)
+    assert {encoding for _, encoding in http.accept_headers} == {"gzip"}
+    compression_lines = [r.getMessage() for r in caplog.records if "compress" in r.getMessage()]
+    assert compression_lines == ["the source compresses stream pages (Content-Encoding: gzip)" if compressed
+                                 else "the source does not compress stream pages; they arrive uncompressed"]
+
+
+@pytest.mark.parametrize("body", [lambda b: gzip.compress(b)[:-12], lambda b: b"\x1f\x8b not gzip at all"],
+                         ids=["truncated", "corrupt"])
+def test_an_undecodable_gzip_page_is_a_sync_error_with_its_stream_and_cursor_and_retried(
+        http: HttpFixture, body: Any) -> None:
+    store = FakeStore()
+    http.bodies["urls"] = body(json.dumps(http.source.page(sync.URLS, 0, 20, {}, 100).rows).encode())
+    http.body_headers = {"Content-Encoding": "gzip"}
     sleeps: list[float] = []
 
     def sleep(seconds: float) -> None:
         sleeps.append(seconds)
         if len(sleeps) == 1:
-            assert store.error is not None and "field larger than field limit" in store.error
-            assert store.cursors["urls"] == sync.Cursor()
+            assert store.error is not None and store.error.startswith("urls at cursor -1:")
+            assert "undecodable gzip body" in store.error
+            assert store.cursors["urls"] == sync.Cursor() and store.cursors["accounts"] == sync.Cursor(20)
             del http.bodies["urls"]
         else:
             raise KeyboardInterrupt
@@ -590,11 +630,3 @@ def test_a_csv_field_over_the_limit_is_a_sync_error_and_retried(http: HttpFixtur
         sync.run(syncer(sync.HttpSource(SOURCE_URL), store), 5, once=False, sleep=sleep)
     assert sleeps == [sync.RETRY_SLEEP_S, 5]
     assert store.error is None and len(store.urls) == 2
-
-
-def test_csv_fields_above_the_csv_module_default_limit_are_read(http: HttpFixture) -> None:
-    store = FakeStore()
-    long_url = "https://a.invalid/" + "y" * 200_000
-    http.source.add_url(long_url, "alice", 1, 18)
-    assert sync.run(syncer(sync.HttpSource(SOURCE_URL), store), 5, once=True) == 0
-    assert store.urls[md5(long_url)] == long_url

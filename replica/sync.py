@@ -33,9 +33,8 @@ MIN_PAGE_SIZE. Other failures set sync_error and are retried with a backoff of
 3 s doubling to 60 s (--once: exit 1).
 """
 import argparse
-import csv
+import gzip
 import hashlib
-import io
 import json
 import logging
 import os
@@ -44,6 +43,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Protocol, TypeVar
@@ -57,8 +57,6 @@ STREAM_SCHEMA_VERSION = 2
 MAX_PAGE_SIZE = 100000
 # The smallest page a slow source path is retried with (or PAGE_LIMIT when lower).
 MIN_PAGE_SIZE = 1000
-# url fields are unbounded TEXT on the primary; csv's default limit is 128 KiB.
-CSV_FIELD_SIZE_LIMIT = 1 << 20
 RETRY_SLEEP_S = 3
 MAX_BACKOFF_S = 60
 HTTP_TIMEOUT_S = 300
@@ -88,19 +86,16 @@ class Stream:
     key_fields: tuple[str, ...]
     after_params: tuple[str, ...]
     int_fields: tuple[str, ...]
-    # CSV cannot tell a NULL from an empty string, so streams with nullable
-    # columns are always read as JSON.
-    csv: bool
 
 
 ACCOUNTS = Stream("accounts", "/stream/accounts", "first_block", ("name",), ("after_name",),
-                  ("first_block", "hive_id"), csv=True)
+                  ("first_block", "hive_id"))
 URLS = Stream("urls", "/stream/urls", "first_block", ("md5",), ("after_md5",),
-              ("first_block",), csv=True)
+              ("first_block",))
 URL_AUTHORS = Stream("url_authors", "/stream/url-authors", "first_block", ("url_md5", "account_name"),
-                     ("after_md5", "after_account"), ("first_block",), csv=True)
+                     ("after_md5", "after_account"), ("first_block",))
 PROFILES = Stream("profiles", "/stream/profiles", "updated_block", ("account_name",), ("after_account",),
-                  ("updated_block",), csv=False)
+                  ("updated_block",))
 # Applied in this order within a cycle: accounts and urls before the rows that
 # reference them.
 STREAMS = (ACCOUNTS, URLS, URL_AUTHORS, PROFILES)
@@ -165,32 +160,26 @@ def _parse_block_time(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
 
 
-class _HttpStatus(SyncError):
-    def __init__(self, status: int, message: str) -> None:
-        super().__init__(message)
-        self.status = status
-
-
 class HttpSource:
     """The primary's API through its URL rewriter (the paths of rewrite_rules.conf)."""
 
     def __init__(self, base_url: str, timeout: float = HTTP_TIMEOUT_S) -> None:
         self._base = base_url.rstrip("/")
         self._timeout = timeout
-        self._csv = True
-        csv.field_size_limit(CSV_FIELD_SIZE_LIMIT)
+        self._compression_logged = False
 
-    def _get(self, path: str, accept: str) -> tuple[bytes, dict[str, str]]:
-        req = urllib.request.Request(self._base + path, headers={"Accept": accept})
+    def _get(self, path: str) -> tuple[bytes, dict[str, str]]:
+        req = urllib.request.Request(self._base + path,
+                                     headers={"Accept": "application/json", "Accept-Encoding": "gzip"})
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                return resp.read(), {k.lower(): v for k, v in resp.headers.items()}
+                body, headers = resp.read(), {k.lower(): v for k, v in resp.headers.items()}
         except urllib.error.HTTPError as err:
             body = err.read()[:500].decode(errors="replace")
             message = f"GET {path}: HTTP {err.code}: {body}"
             if err.code in (502, 504):
                 raise SourceTimeout(message) from err
-            raise _HttpStatus(err.code, message) from err
+            raise SyncError(message) from err
         except TimeoutError as err:
             raise SourceTimeout(f"GET {path}: no answer within {self._timeout} s") from err
         except urllib.error.URLError as err:
@@ -199,9 +188,18 @@ class HttpSource:
             raise SyncError(f"GET {path}: {err}") from err
         except OSError as err:
             raise SyncError(f"GET {path}: {err}") from err
+        encoding = headers.get("content-encoding", "identity").strip().lower()
+        if encoding == "gzip":
+            try:
+                body = gzip.decompress(body)
+            except (OSError, EOFError, zlib.error) as err:
+                raise SyncError(f"GET {path}: undecodable gzip body: {type(err).__name__}: {err}") from err
+        elif encoding != "identity":
+            raise SyncError(f"GET {path}: unsupported Content-Encoding {encoding!r}")
+        return body, headers
 
     def _get_json(self, path: str) -> Any:
-        body, _ = self._get(path, "application/json")
+        body, _ = self._get(path)
         try:
             return json.loads(body)
         except ValueError as err:
@@ -227,25 +225,20 @@ class HttpSource:
         query = urllib.parse.urlencode(
             {"from_block": from_block, "to_block": to_block, **after, "page_size": page_size})
         path = f"{stream.path}?{query}"
-        use_csv = stream.csv and self._csv
-        try:
-            body, headers = self._get(path, "text/csv" if use_csv else "application/json")
-        except _HttpStatus as err:
-            if not (use_csv and err.status == 406):
-                raise
-            log.info("the source does not offer text/csv; reading pages as JSON")
-            self._csv = False
-            body, headers = self._get(path, "application/json")
-        try:
-            if headers.get("content-type", "").startswith("text/csv"):
-                rows: list[dict[str, Any]] = list(csv.DictReader(io.StringIO(body.decode())))
+        body, headers = self._get(path)
+        if not self._compression_logged:
+            self._compression_logged = True
+            if headers.get("content-encoding", "").strip().lower() == "gzip":
+                log.info("the source compresses stream pages (Content-Encoding: gzip)")
             else:
-                rows = json.loads(body)
+                log.info("the source does not compress stream pages; they arrive uncompressed")
+        try:
+            rows: list[dict[str, Any]] = json.loads(body)
             for row in rows:
                 for field in stream.int_fields:
                     row[field] = int(row[field])
             to_block = int(headers["stream-to-block"])
-        except (ValueError, KeyError, TypeError, csv.Error) as err:
+        except (ValueError, KeyError, TypeError) as err:
             raise SyncError(f"GET {path}: undecodable page: {type(err).__name__}: {err}") from err
         return Page(rows, to_block, headers.get("stream-sync-uuid"))
 
