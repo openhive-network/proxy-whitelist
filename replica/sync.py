@@ -73,6 +73,9 @@ MIN_PAGE_SIZE = 1000
 RETRY_SLEEP_S = 3
 MAX_BACKOFF_S = 60
 HTTP_TIMEOUT_S = 300
+# A page body below this may arrive uncompressed from a source that compresses
+# larger ones (caddy's encode minimum_length), so it decides no compression verdict.
+_COMPRESSIBLE_PAGE_BYTES = 1024
 
 log = logging.getLogger("proxy_whitelist_replica")
 _T = TypeVar("_T")
@@ -167,6 +170,7 @@ class Store(Protocol):
     def finish_cycle(self, source_url: str, status: SourceStatus) -> None: ...
     def set_error(self, message: str) -> None: ...
     def set_purge_enabled(self, enabled: bool) -> None: ...
+    def queued_purges(self) -> int: ...
 
 
 def _parse_block_time(value: str | None) -> datetime | None:
@@ -242,11 +246,7 @@ class HttpSource:
         path = f"{stream.path}?{query}"
         body, headers = self._get(path)
         if not self._compression_logged:
-            self._compression_logged = True
-            if headers.get("content-encoding", "").strip().lower() == "gzip":
-                log.info("the source compresses stream pages (Content-Encoding: gzip)")
-            else:
-                log.info("the source does not compress stream pages; they arrive uncompressed")
+            self._log_compression(body, headers)
         try:
             rows: list[dict[str, Any]] = json.loads(body)
             for row in rows:
@@ -256,6 +256,15 @@ class HttpSource:
         except (ValueError, KeyError, TypeError) as err:
             raise SyncError(f"GET {path}: undecodable page: {type(err).__name__}: {err}") from err
         return Page(rows, to_block, headers.get("stream-sync-uuid"))
+
+    def _log_compression(self, body: bytes, headers: dict[str, str]) -> None:
+        if headers.get("content-encoding", "").strip().lower() == "gzip":
+            log.info("the source compresses stream pages (Content-Encoding: gzip)")
+        elif len(body) >= _COMPRESSIBLE_PAGE_BYTES:
+            log.info("the source does not compress stream pages; a page of %d bytes arrived uncompressed", len(body))
+        else:
+            return
+        self._compression_logged = True
 
     def blacklists(self) -> tuple[list[str], list[str]]:
         data = self._get_json("/stream/blacklists")
@@ -320,11 +329,10 @@ class Syncer:
                 f"the source serves stream_schema_version {status.stream_schema_version}, "
                 f"this syncer reads {STREAM_SCHEMA_VERSION}")
         state = self.store.load()
-        if not self._purge_enabled_recorded:
-            self.store.set_purge_enabled(self._purger is not None)
-            self._purge_enabled_recorded = True
         if not self._rebuild_checked:
             state = self._rebuilt(state, status)
+        if not self._purge_enabled_recorded:
+            self._record_purge_enabled()
         if state.sync_uuid is None:
             log.info("first contact with %s: sync_uuid %s", self.source_url, status.sync_uuid)
             self.store.adopt_source(self.source_url, status)
@@ -338,6 +346,14 @@ class Syncer:
             self.store.reset(self.source_url, status, state.rebuild_env_honoured)
             return self.store.load()
         return state
+
+    def _record_purge_enabled(self) -> None:
+        self.store.set_purge_enabled(self._purger is not None)
+        self._purge_enabled_recorded = True
+        if self._purger is None:
+            queued = self.store.queued_purges()
+            if queued:
+                log.warning("%d accounts are queued for purging but purging is off; they stay queued", queued)
 
     def _rebuilt(self, state: State, status: SourceStatus) -> State:
         """Truncates the replica when a rebuild is requested and not yet honoured; returns the state to sync from."""
@@ -656,6 +672,13 @@ class PgStore:
     def set_purge_enabled(self, enabled: bool) -> None:
         self._transaction(lambda cur: cur.execute(
             "UPDATE proxy_whitelist_replica.state SET purge_enabled = %s", (enabled,)))
+
+    def queued_purges(self) -> int:
+        def work(cur: psycopg.Cursor) -> int:
+            cur.execute("SELECT count(*) FROM proxy_whitelist_replica.purge_queue")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+        return self._transaction(work)
 
     def pending_purges(self, limit: int) -> list[PurgeItem]:
         def work(cur: psycopg.Cursor) -> list[PurgeItem]:

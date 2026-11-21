@@ -68,10 +68,13 @@ stored corrupted. That encoding is not documented, so CSV is not used at all.
 Every request sends `Accept-Encoding: gzip`; a `Content-Encoding: gzip` answer
 (caddy's `encode`) is decompressed before it is parsed, and an uncompressed
 answer is read as is. A urls page of 100000 rows is about 17 MB as JSON and
-about 6 MB compressed. The first stream page of a process logs at INFO whether
-the source compresses (`the source compresses stream pages` or `the source does
-not compress stream pages`), so a slow bootstrap over the WAN can be told apart
-from one whose path strips compression.
+about 6 MB compressed. The first stream page of a process that settles it logs
+at INFO whether the source compresses (`the source compresses stream pages` or
+`the source does not compress stream pages`), so a slow bootstrap over the WAN
+can be told apart from one whose path strips compression. An uncompressed page
+below 1024 bytes settles nothing (caddy leaves short answers uncompressed, e.g.
+the empty `[]` pages of a resumed replica), so the line can come late, or never
+when every page of the process is that small.
 
 ### Page budget
 
@@ -99,6 +102,12 @@ out of the replica's lists until a later cycle delivers them. Rows the operator
 deletes on the primary (`cli/blacklist.py remove-all`) are not replicated: the
 streams do not report deletions. After such a removal, force a rebuild of every
 replica ([`--rebuild`](#forced-rebuild---rebuild)).
+
+Known difference: a replica bootstrapped from a primary installed before the
+placeholder fix keeps hivemind's placeholder account (`hive_id` 0, empty name)
+in `proxy_whitelist_app.accounts`. The primary's install deletes the row and no
+longer backfills it, but that deletion is not streamed either; the row leaves
+the replica with its next rebuild. It is never looked up.
 
 ### Bootstrap
 
@@ -283,7 +292,11 @@ also truncate `purge_queue` with the replicated tables.
 Purging is off unless all three of these are set for `replica-sync` (in
 `replica/.env`); with any unset nothing is queued either, so a replica without
 purge duty accumulates no queue, and the syncer logs at start that purging is off.
-Enable it on **one** replica per zone.
+Enable it on **one** replica per zone. Every start records whether purging is on
+in `purge_enabled` (`/sync-status`) on its first cycle, so switching it off
+clears the flag; rows already in the queue stay there, and the syncer logs once
+how many (`N accounts are queued for purging but purging is off`) for an
+operator to drain by enabling purging again or to delete.
 
 | variable | |
 | --- | --- |

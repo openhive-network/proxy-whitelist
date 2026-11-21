@@ -14,6 +14,11 @@ SELECT
     now() AS created_at
 FROM generate_series(1, 5) AS i;
 
+-- Hivemind's placeholder account, which no backfill gives an accounts row.
+INSERT INTO hivemind_app.hive_accounts (id, name, created_at)
+VALUES (0, '', now())
+ON CONFLICT DO NOTHING;
+
 SET ROLE proxy_whitelist_owner;
 
 DO $$
@@ -32,7 +37,7 @@ BEGIN
     END IF;
     IF EXISTS (
         SELECT 1 FROM hivemind_app.hive_accounts ha
-        WHERE ha.id <= __cursor
+        WHERE ha.id <= __cursor AND ha.id != 0 AND ha.name != ''
           AND NOT EXISTS (SELECT 1 FROM proxy_whitelist_app.accounts a WHERE a.hive_id = ha.id)
     ) THEN
         RAISE EXCEPTION 'install: a hivemind account has no accounts row after backfill_accounts';
@@ -91,9 +96,13 @@ BEGIN
     END IF;
     IF EXISTS (
         SELECT 1 FROM hivemind_app.hive_accounts ha
-        WHERE NOT EXISTS (SELECT 1 FROM proxy_whitelist_app.accounts a WHERE a.hive_id = ha.id)
+        WHERE ha.id != 0 AND ha.name != ''
+          AND NOT EXISTS (SELECT 1 FROM proxy_whitelist_app.accounts a WHERE a.hive_id = ha.id)
     ) THEN
         RAISE EXCEPTION 'backfill_accounts: a hivemind account still has no accounts row';
+    END IF;
+    IF EXISTS (SELECT 1 FROM proxy_whitelist_app.accounts WHERE hive_id = 0 OR name = '') THEN
+        RAISE EXCEPTION 'backfill_accounts: hivemind''s placeholder account has an accounts row';
     END IF;
     __got := ARRAY(
         SELECT a.name || '|' || a.first_block
