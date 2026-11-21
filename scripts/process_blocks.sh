@@ -84,7 +84,7 @@ psql "$(postgres_access proxy_whitelist_startup)" -v ON_ERROR_STOP=on -Atc \
 if command -v haf_app_driver.py >/dev/null 2>&1; then
     limit_arg=()
     [ "$PROCESS_BLOCK_LIMIT" != "null" ] && limit_arg=(--stop-at-block="$PROCESS_BLOCK_LIMIT")
-    exec haf_app_driver.py --app="${PROXY_WHITELIST_SCHEMA}" --postgres-url="$(postgres_access proxy_whitelist_block_processing)" \
+    exec haf_app_driver.py --app=proxy-whitelist --postgres-url="$(postgres_access proxy_whitelist_block_processing)" \
         --lock=hivemind --lock=proxy-whitelist --startup-marker=/tmp/proxy_whitelist_startup_time.txt "${limit_arg[@]}"
 fi
 echo "WARNING: haf_app_driver.py not found, falling back to the legacy CALL scheduler() loop"
