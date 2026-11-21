@@ -196,4 +196,18 @@ CREATE TABLE IF NOT EXISTS proxy_whitelist_app.account_profiles (
 CREATE INDEX IF NOT EXISTS account_profiles_by_updated_block
 ON proxy_whitelist_app.account_profiles (updated_block, account_id);
 
+-- Migration: hivemind's placeholder account (id 0, empty name) was backfilled
+-- as an account by earlier installs; track_account_creations() skips it now.
+DELETE FROM proxy_whitelist_app.account_profiles p
+USING proxy_whitelist_app.accounts a
+WHERE p.account_id = a.id AND (a.hive_id = 0 OR a.name = '');
+DELETE FROM proxy_whitelist_app.blacklisted_accounts b
+USING proxy_whitelist_app.accounts a
+WHERE b.account_id = a.id AND (a.hive_id = 0 OR a.name = '');
+DELETE FROM proxy_whitelist_app.url_authors ua
+USING proxy_whitelist_app.accounts a
+WHERE ua.author_id = a.id AND (a.hive_id = 0 OR a.name = '');
+DELETE FROM proxy_whitelist_app.accounts
+WHERE hive_id = 0 OR name = '';
+
 RESET ROLE;

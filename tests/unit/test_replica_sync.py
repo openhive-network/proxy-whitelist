@@ -184,6 +184,9 @@ class FakeStore:
     def set_purge_enabled(self, enabled: bool) -> None:
         self.purge_enabled = enabled
 
+    def queued_purges(self) -> int:
+        return len(self.purge_queue)
+
     def replace_blacklists(self, urls: list[str], accounts: list[str]) -> None:
         self.blacklist = (urls, accounts)
 
@@ -205,8 +208,8 @@ class HttpFixture:
 
     failures[stream] are raised, one per request, before that stream's next pages are
     served; bodies[stream] replaces the body of its pages, sent with body_headers. With
-    gzip set, answers to a request accepting gzip are compressed, as caddy's encode
-    directive does."""
+    gzip set, answers of at least gzip_min_length bytes to a request accepting gzip are
+    compressed, as caddy's encode directive does."""
 
     def __init__(self, source: FakeSource) -> None:
         self.source = source
@@ -214,6 +217,7 @@ class HttpFixture:
         self.bodies: dict[str, bytes] = {}
         self.body_headers: dict[str, str] = {}
         self.gzip = False
+        self.gzip_min_length = 0
         self.accept_headers: set[tuple[str | None, str | None]] = set()
         self.page_requests: list[tuple[str, int, dict[str, str], int, str]] = []
 
@@ -222,16 +226,16 @@ class HttpFixture:
         path = url.path.removeprefix(urllib.parse.urlsplit(SOURCE_URL).path)
         query = dict(urllib.parse.parse_qsl(url.query))
         self.accept_headers.add((req.get_header("Accept"), req.get_header("Accept-encoding")))
-        compress = self.gzip and "gzip" in (req.get_header("Accept-encoding") or "")
+        accepts_gzip = self.gzip and "gzip" in (req.get_header("Accept-encoding") or "")
         if path == "/sync-status":
             status = self.source.status()
             return self._answer(json.dumps({
                 "last_block_num": status.block_num, "last_block_time": status.block_time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "sync_uuid": status.sync_uuid, "stream_schema_version": status.stream_schema_version,
-                "stream_sentinel_block": status.stream_sentinel_block}).encode(), compress)
+                "stream_sentinel_block": status.stream_sentinel_block}).encode(), accepts_gzip)
         if path == "/stream/blacklists":
             urls, accounts = self.source.blacklists()
-            return self._answer(json.dumps({"urls": urls, "accounts": accounts}).encode(), compress)
+            return self._answer(json.dumps({"urls": urls, "accounts": accounts}).encode(), accepts_gzip)
         stream = next(s for s in sync.STREAMS if s.path == path)
         after = {p: query[p] for p in stream.after_params if p in query}
         failures = self.failures.get(stream.name, [])
@@ -243,12 +247,11 @@ class HttpFixture:
         headers = {"Stream-To-Block": str(page.to_block), "Stream-Sync-Uuid": page.sync_uuid}
         if stream.name in self.bodies:
             return Response(self.bodies[stream.name], {"Content-Type": "application/json", **headers, **self.body_headers})
-        return self._answer(json.dumps(page.rows).encode(), compress, headers)
+        return self._answer(json.dumps(page.rows).encode(), accepts_gzip, headers)
 
-    @staticmethod
-    def _answer(body: bytes, compress: bool, headers: dict[str, str] | None = None) -> "Response":
+    def _answer(self, body: bytes, accepts_gzip: bool, headers: dict[str, str] | None = None) -> "Response":
         headers = {"Content-Type": "application/json", **(headers or {})}
-        if compress:
+        if accepts_gzip and len(body) >= self.gzip_min_length:
             body, headers["Content-Encoding"] = gzip.compress(body), "gzip"
         return Response(body, headers)
 
@@ -628,11 +631,17 @@ def test_pages_are_read_as_json_with_every_value_exact(http: HttpFixture) -> Non
     assert {accept for accept, _ in http.accept_headers} == {"application/json"}
 
 
+def add_urls(source: FakeSource, count: int, block: int) -> None:
+    for i in range(count):
+        source.add_url(f"https://a.invalid/page-filler/{block}/{i}.png", "carol", 3, block)
+
+
 @pytest.mark.parametrize("compressed", [True, False], ids=["gzip", "identity"])
 def test_a_compressed_source_yields_the_same_rows_and_the_first_page_logs_whether_it_compresses(
         http: HttpFixture, compressed: bool, caplog: pytest.LogCaptureFixture) -> None:
     http.gzip = compressed
     http.source.add_url(ODD_URL, "alice", 1, 18)
+    add_urls(http.source, 30, 18)
     store, expected = FakeStore(), FakeStore()
     syncer(http.source, expected).cycle()
     with caplog.at_level(logging.INFO, logger="proxy_whitelist_replica"):
@@ -642,8 +651,34 @@ def test_a_compressed_source_yields_the_same_rows_and_the_first_page_logs_whethe
         (expected.accounts, expected.urls, expected.url_authors, expected.profiles, expected.blacklist)
     assert {encoding for _, encoding in http.accept_headers} == {"gzip"}
     compression_lines = [r.getMessage() for r in caplog.records if "compress" in r.getMessage()]
-    assert compression_lines == ["the source compresses stream pages (Content-Encoding: gzip)" if compressed
-                                 else "the source does not compress stream pages; they arrive uncompressed"]
+    assert len(compression_lines) == 1
+    if compressed:
+        assert compression_lines == ["the source compresses stream pages (Content-Encoding: gzip)"]
+    else:
+        assert compression_lines[0].startswith("the source does not compress stream pages; a page of ")
+
+
+def test_pages_too_small_to_compress_decide_no_verdict_until_a_later_page_arrives_compressed(
+        http: HttpFixture, caplog: pytest.LogCaptureFixture) -> None:
+    store = FakeStore()
+    syncer(http.source, store).cycle()
+    http.gzip, http.gzip_min_length = True, 1024
+    http.source.head = 21
+    add_urls(http.source, 30, 21)
+    with caplog.at_level(logging.INFO, logger="proxy_whitelist_replica"):
+        assert sync.run(syncer(sync.HttpSource(SOURCE_URL), store), 5, once=True) == 0
+
+    assert len(store.urls) == 32
+    compression_lines = [r.getMessage() for r in caplog.records if "compress" in r.getMessage()]
+    assert compression_lines == ["the source compresses stream pages (Content-Encoding: gzip)"]
+
+
+def test_a_source_whose_pages_are_all_too_small_to_compress_logs_no_verdict(
+        http: HttpFixture, caplog: pytest.LogCaptureFixture) -> None:
+    http.gzip, http.gzip_min_length = True, 1024
+    with caplog.at_level(logging.INFO, logger="proxy_whitelist_replica"):
+        assert sync.run(syncer(sync.HttpSource(SOURCE_URL), FakeStore()), 5, once=True) == 0
+    assert not [r for r in caplog.records if "compress" in r.getMessage()]
 
 
 @pytest.mark.parametrize("body", [lambda b: gzip.compress(b)[:-12], lambda b: b"\x1f\x8b not gzip at all"],
@@ -953,6 +988,29 @@ def test_purging_without_its_full_configuration_is_off_queues_nothing_and_is_log
     assert store.purge_queue == {} and not store.purge_enabled
     assert sum("Cloudflare purging is off" in r.getMessage() for r in caplog.records) == 2, "once per start"
     assert TOKEN not in caplog.text
+
+
+def test_a_syncer_started_without_purging_clears_the_flag_and_logs_once_what_stays_queued(
+        monkeypatch: pytest.MonkeyPatch, clock: Clock, caplog: pytest.LogCaptureFixture) -> None:
+    source, store, s, cloudflare = bootstrapped(monkeypatch, clock)
+    cloudflare.answers = [http_error(503)]
+    source.head = 21
+    source.set_profile("alice", "https://a.invalid/avatar2.png", None, 21)
+    s.cycle()
+    assert "alice" in store.purge_queue and store.purge_enabled
+
+    s = syncer(source, store)
+    with caplog.at_level(logging.INFO, logger="proxy_whitelist_replica"):
+        s.cycle()
+        source.head = 22
+        source.set_profile("alice", "https://a.invalid/avatar3.png", None, 22)
+        s.cycle()
+
+    assert not store.purge_enabled and store.error is None
+    assert store.profiles["alice"][0] == "https://a.invalid/avatar3.png"
+    assert store.purge_queue["alice"]["block"] == 21, "queued rows stay; nothing new is queued"
+    off_lines = [r.getMessage() for r in caplog.records if "purging is off" in r.getMessage()]
+    assert off_lines == ["1 accounts are queued for purging but purging is off; they stay queued"]
 
 
 def test_purging_configured_from_the_environment_purges_and_never_logs_the_token(

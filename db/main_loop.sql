@@ -270,8 +270,9 @@ $$;
 -- cursor to the highest hivemind id seen. A cursor rather than the highest
 -- hive_id in accounts: the other insert sites (ensure_account) may add an
 -- account above ones not yet tracked. Accounts that already have a row keep
--- it. _block must be above every block the streams have served, or a replica
--- never sees the new rows. Returns the rows written.
+-- it; hivemind's placeholder account (id 0, empty name) gets none. _block must
+-- be above every block the streams have served, or a replica never sees the
+-- new rows. Returns the rows written.
 CREATE OR REPLACE FUNCTION proxy_whitelist_app.track_account_creations(_block INT)
 RETURNS INT
 LANGUAGE plpgsql
@@ -298,6 +299,7 @@ BEGIN
     SELECT ha.id, ha.name, _block
     FROM hivemind_app.hive_accounts ha
     WHERE (__from IS NULL OR ha.id > __from) AND ha.id <= __to
+      AND ha.id != 0 AND ha.name != ''
     ON CONFLICT (hive_id) DO NOTHING;
     GET DIAGNOSTICS __count = ROW_COUNT;
 

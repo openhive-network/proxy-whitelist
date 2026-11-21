@@ -160,8 +160,13 @@ install() {
 reinstall() {
     local before after
     before="$(query "select sync_uuid from proxy_whitelist_app.app_status")" || return 1
+    # As earlier installs backfilled it: the reinstall deletes the placeholder.
+    query "insert into proxy_whitelist_app.accounts (hive_id, name, first_block) values (0, '', 0)
+           on conflict do nothing" > /dev/null || return 1
     install_app || return 1
     installed_ok || return 1
+    [ "$(query "select count(*) from proxy_whitelist_app.accounts where hive_id = 0 or name = ''")" = 0 ] \
+        || { echo "hivemind's placeholder account kept an accounts row after a reinstall"; return 1; }
     after="$(query "select sync_uuid from proxy_whitelist_app.app_status")" || return 1
     [ -n "$before" ] && [ "$before" = "$after" ] || { echo "sync_uuid changed on reinstall: '$before' -> '$after'"; return 1; }
     echo "sync_uuid kept: $after"
