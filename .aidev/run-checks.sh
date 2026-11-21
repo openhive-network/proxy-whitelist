@@ -17,13 +17,19 @@
 #   - install         scripts/install_app.sh into the stack's HAF database
 #                     (PROXY_WHITELIST_TEST_DB_HOST, default `haf`), which already
 #                     has hivemind installed, through install_with_app_lock.py;
-#                     then the schema, the endpoint schema and the HAF context exist,
+#                     then the schema, the endpoint schema, the HAF context and its
+#                     registry row under the lock name proxy-whitelist exist,
 #                     and every tests/sql/*.sql check passes against the installed app
 #   - reinstall       install_app.sh a second time over the installed app (there is
 #                     no uninstall script; the installer is idempotent), the
 #                     endpoint schema is still there, the stream source
 #                     identity (app_status.sync_uuid) is unchanged and the
-#                     accounts backfill logs 0 rows
+#                     accounts backfill logs 0 rows; a third run skips while a
+#                     session holding the block processor's proxy-whitelist lock stands in for
+#                     the processor the stack does not run; a fourth over a
+#                     registry row under the old name proxy_whitelist_app fails
+#                     naming its hive.app_unregister remedy, and after that
+#                     remedy a fifth registers proxy-whitelist again
 #   - api-smoke       .aidev/api_smoke.py: PostgREST on the installed schema as
 #                     production runs it, then check_url through unknown →
 #                     whitelisted → blacklisted, the blacklisted_accounts form,
@@ -138,7 +144,9 @@ installed_ok() {
     [ "$(query "select 1 from pg_namespace where nspname = 'proxy_whitelist_endpoints'")" = 1 ] || { echo "no proxy_whitelist_endpoints schema"; return 1; }
     [ "$(query "select hive.app_context_exists('proxy_whitelist_app')")" = t ] || { echo "HAF context proxy_whitelist_app does not exist"; return 1; }
     [ "$(query "select to_regprocedure('proxy_whitelist_endpoints.check_url(text, text[])') is not null")" = t ] || { echo "check_url(text, text[]) is not installed"; return 1; }
-    echo "schema, endpoint schema, HAF context and check_url present"
+    [ "$(query "select string_agg(name, ',') from hafd.applications where contexts @> array['proxy_whitelist_app']")" = proxy-whitelist ] \
+        || { echo "context proxy_whitelist_app is not registered by exactly the application proxy-whitelist"; return 1; }
+    echo "schema, endpoint schema, HAF context, registry row proxy-whitelist and check_url present"
 }
 sql_checks() {
     local f
@@ -173,6 +181,58 @@ reinstall() {
     grep -q "accounts: backfilled 0 accounts at block " "$out/install_app.log" \
         || { echo "the reinstall's backfill_accounts did not log 0 rows backfilled"; return 1; }
     echo "accounts backfill: 0 rows on reinstall"
+    reinstall_skips_under_block_processor_lock || return 1
+    install_refuses_leftover_registration
+}
+# The stack runs no block processor: a session holding its proxy-whitelist lock
+# stands in for one.
+reinstall_skips_under_block_processor_lock() {
+    local holder=proxy_whitelist_check_block_processor i held="" rc=0
+    psql "$ADMIN_URL?application_name=$holder" -v ON_ERROR_STOP=on -Atq \
+        -c "select hive.acquire_app_block_processor_locks(array['proxy-whitelist'])" \
+        -c "select pg_sleep(600)" > /dev/null 2>&1 &
+    for i in $(seq 30); do
+        held="$(query "select 1 from pg_stat_activity where application_name = '$holder' and query like 'select pg_sleep%'")"
+        [ "$held" = 1 ] && break
+        sleep 1
+    done
+    if [ "$held" != 1 ]; then
+        echo "the stand-in block processor did not take its locks"; rc=1
+    else
+        install_app || { echo "install_app.sh failed while a block processor held the proxy-whitelist lock"; rc=1; }
+        [ "$rc" -ne 0 ] || grep -q "Skipping install: lock on proxy-whitelist held by $holder" "$out/install_app.log" \
+            || { echo "install_app.sh did not skip while a block processor held the proxy-whitelist lock"; rc=1; }
+    fi
+    query "select pg_terminate_backend(pid) from pg_stat_activity where application_name = '$holder'" > /dev/null
+    wait
+    [ "$rc" -eq 0 ] && echo "install skipped while a block processor held the proxy-whitelist lock"
+    return "$rc"
+}
+# A registration left under the pre-rename name fails the install, which
+# registers nothing; unregistering it as the error says lets the next one through.
+install_refuses_leftover_registration() {
+    local hivemind
+    hivemind="$(query "select name from hafd.applications where contexts @> array['hivemind_app']")" || return 1
+    query "select hive.app_unregister('proxy-whitelist');
+           set role proxy_whitelist_owner;
+           select hive.app_register('proxy_whitelist_app', array['proxy_whitelist_app']::hive.contexts_group, 'proxy_whitelist_app.process_blocks');
+           select hive.app_add_dependency('proxy_whitelist_app', '$hivemind')" > /dev/null || return 1
+    if install_app; then
+        echo "install_app.sh succeeded over a registry row proxy_whitelist_app"; return 1
+    fi
+    if ! grep -qF "HAF application proxy_whitelist_app holds context proxy_whitelist_app" "$out/install_app.log" \
+        || ! grep -qF "SELECT hive.app_unregister('proxy_whitelist_app');" "$out/install_app.log"; then
+        echo "the refused install did not name the row proxy_whitelist_app and its hive.app_unregister remedy"; return 1
+    fi
+    [ "$(query "select string_agg(name, ',') from hafd.applications where contexts @> array['proxy_whitelist_app']")" = proxy_whitelist_app ] \
+        || { echo "the refused install changed the registry"; return 1; }
+    echo "install refused over a registry row proxy_whitelist_app"
+    query "select hive.app_unregister('proxy_whitelist_app')" > /dev/null || return 1
+    install_app || return 1
+    installed_ok || return 1
+    [ "$(query "select count(*) from hafd.application_dependencies where application = 'proxy-whitelist' and depends_on = '$hivemind'")" = 1 ] \
+        || { echo "proxy-whitelist does not depend on $hivemind after the reinstall"; return 1; }
+    echo "registered as proxy-whitelist after hive.app_unregister('proxy_whitelist_app') and a reinstall"
 }
 
 # replica_query SQL: one value, as the replica's superuser

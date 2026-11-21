@@ -883,12 +883,38 @@ BEGIN
 END
 $$;
 
--- Register with the HAF application registry (driver entry point above) and
--- declare the dependency on hivemind, which must already be registered (the
--- hivemind install runs first). hivemind's registry name is looked up by its
--- context: it registered as 'hivemind_app' before hivemind#445 and as
--- 'hivemind' since, and a dependency on a name that is not registered fails.
-SELECT hive.app_register( 'proxy_whitelist_app', ARRAY[ 'proxy_whitelist_app' ]::hive.contexts_group, 'proxy_whitelist_app.process_blocks' );
+-- Raises when the registry holds this app's context under a name other than
+-- 'proxy-whitelist' (installs before the rename registered as
+-- 'proxy_whitelist_app'). hive.app_register would take such a row for an
+-- embedding application and leave it in place, so the operator removes it.
+CREATE OR REPLACE FUNCTION proxy_whitelist_app.check_registered_name()
+RETURNS VOID
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    __leftover TEXT;
+BEGIN
+    SELECT a.name INTO __leftover
+    FROM hafd.applications a
+    WHERE a.contexts @> ARRAY['proxy_whitelist_app'] AND a.name != 'proxy-whitelist'
+    LIMIT 1;
+    IF __leftover IS NOT NULL THEN
+        RAISE EXCEPTION 'HAF application % holds context proxy_whitelist_app, which proxy-whitelist registers as application proxy-whitelist: replay from scratch, or run SELECT hive.app_unregister(%); and rerun the install',
+                        __leftover, quote_literal(__leftover);
+    END IF;
+END
+$$;
+
+-- Register with the HAF application registry (driver entry point above) under
+-- the name of the app's lock, which HAF's install and block-processor lock
+-- helpers look the row up by, and declare the dependency on hivemind, which
+-- must already be registered (the hivemind install runs first). hivemind's
+-- registry name is looked up by its context: it registered as 'hivemind_app'
+-- before hivemind#445 and as 'hivemind' since, and a dependency on a name that
+-- is not registered fails.
+SELECT proxy_whitelist_app.check_registered_name();
+SELECT hive.app_register( 'proxy-whitelist', ARRAY[ 'proxy_whitelist_app' ]::hive.contexts_group, 'proxy_whitelist_app.process_blocks' );
 DO $$
 DECLARE
   __hivemind TEXT[];
@@ -901,7 +927,7 @@ BEGIN
   ELSIF cardinality(__hivemind) > 1 THEN
     RAISE EXCEPTION 'Cannot add proxy-whitelist''s dependency on hivemind: its context hivemind_app is registered by applications %', __hivemind;
   ELSE
-    PERFORM hive.app_add_dependency( 'proxy_whitelist_app', __hivemind[1] );
+    PERFORM hive.app_add_dependency( 'proxy-whitelist', __hivemind[1] );
   END IF;
 END
 $$;
